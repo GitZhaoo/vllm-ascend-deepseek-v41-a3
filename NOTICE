@@ -1,0 +1,23 @@
+vllm-ascend-deepseek-v41-a3
+Copyright 2026 The vllm-ascend-deepseek-v41-a3 contributors
+
+This product includes software developed by the vLLM project
+(https://github.com/vllm-project/vllm) and the vLLM Ascend project
+(https://github.com/vllm-project/vllm-ascend), both licensed under the
+Apache License, Version 2.0.
+
+The files under scripts/patches/vllm-ascend-v41-rc2/ are patches against
+vLLM Ascend v0.30.0rc2. They were originally derived from the CJYLZS
+DeepSeek-V4.1 reference repository and have been modified and validated in
+this deployment. All patched source files remain subject to the upstream
+Apache-2.0 license.
+
+DeepSeek-V4.1-Flash-1017-w8a8 model weights are published separately by
+Eco-Tech on ModelScope. The model card declares the MIT License. This
+repository does not distribute model weights.
+
+The Ascend container image referenced by scripts/setup_rootfs.sh is provided
+by its publisher and is downloaded by the user at runtime; it is not part of
+this repository.
+
+Third-party components retain their own licenses and copyright notices.

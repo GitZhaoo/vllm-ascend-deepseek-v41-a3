@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Shell syntax
+        run: |
+          for f in scripts/*.sh examples/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S error scripts/*.sh examples/*.sh
+          else
+            echo "shellcheck unavailable, skipping"
+          fi
+
+      - name: Python compile
+        run: python3 -m py_compile scripts/*.py tests/*.py examples/*.py
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v

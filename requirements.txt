@@ -1,0 +1,7 @@
+# Optional client-side / benchmark dependencies.
+# The server itself runs entirely from the extracted rootfs and needs none of
+# these installed on the host.
+aiohttp>=3.9
+pyzmq>=25
+msgspec>=0.18
+openai>=1.0

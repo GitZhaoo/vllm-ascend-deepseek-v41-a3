@@ -1,0 +1,20 @@
+# Outputs and local state
+logs/
+*.log
+models/
+*.layers/
+*.tar
+*.tar.gz
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Machine-specific configuration (keep the .example files)
+config/dsv41.env
+config/dsv41.local.env
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
