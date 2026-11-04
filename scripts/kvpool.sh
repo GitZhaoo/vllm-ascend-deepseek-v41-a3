@@ -37,8 +37,13 @@ MOONCAKE_CFG="$DSV41_KVPOOL_STATE_DIR/mooncake.json"
 RFS=${DSV41_ROOTFS%/}
 
 # /dev/tcp probe keeps this dependency-free on hosts without ss/netcat.
+# A 2 s timeout avoids hanging on an unreachable remote master address.
 port_open() {
-  (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null && exec 3>&- 2>/dev/null
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 2 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+  else
+    (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null
+  fi
 }
 
 rootfs_python() {
@@ -78,7 +83,13 @@ JSON
 master_pid() {
   local pid=""
   [ -f "$DSV41_MOONCAKE_PID_FILE" ] && pid=$(cat "$DSV41_MOONCAKE_PID_FILE" 2>/dev/null || true)
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { echo "$pid"; return 0; }
+  # Guard against PID reuse after a reboot: only trust the pidfile when the
+  # process really is mooncake_master.
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+    && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "mooncake_master"; then
+    echo "$pid"
+    return 0
+  fi
   return 1
 }
 
@@ -93,18 +104,22 @@ cmd_start() {
     return 0
   fi
 
-  local py bin home
+  local py bin home launcher
   py=$(rootfs_python)
   home=${py%/bin/python3.12}
   bin=${DSV41_MOONCAKE_MASTER_BIN:-$home/bin/mooncake_master}
   [ -x "$bin" ] || die "找不到 mooncake_master: $bin（设置 DSV41_MOONCAKE_MASTER_BIN）"
+  # setsid puts the entry script and the real binary it spawns in one process
+  # group, so stop can terminate the whole tree.
+  launcher=setsid
+  command -v setsid >/dev/null 2>&1 || launcher=nohup
 
   render_config >/dev/null
   mkdir -p "$(dirname "$DSV41_MOONCAKE_LOG")"
   log "启动 mooncake_master → $DSV41_MOONCAKE_MASTER (metrics :$DSV41_MOONCAKE_METRICS_PORT，日志 $DSV41_MOONCAKE_LOG)"
   HOME="${HOME:-/root}" PYTHONHOME="$home" \
     PYTHONPATH="$RFS/vllm-workspace/vllm-ascend:$RFS/vllm-workspace/vllm" \
-    nohup "$bin" --rpc_port="$MASTER_PORT" --metrics_port="$DSV41_MOONCAKE_METRICS_PORT" \
+    "$launcher" "$bin" "--rpc_port=$MASTER_PORT" "--metrics_port=$DSV41_MOONCAKE_METRICS_PORT" \
       >"$DSV41_MOONCAKE_LOG" 2>&1 &
   pid=$!
   echo "$pid" > "$DSV41_MOONCAKE_PID_FILE"
@@ -120,18 +135,40 @@ cmd_start() {
 }
 
 cmd_stop() {
-  local pid
+  local pid pgid own_pgid
   if ! pid=$(master_pid); then
     log "没有 harness 启动的 mooncake_master 在运行"
     rm -f "$DSV41_MOONCAKE_PID_FILE"
     return 0
   fi
-  log "停止 mooncake_master (pid=$pid)"
-  kill "$pid" 2>/dev/null || true
+  # The mooncake_master entry script spawns the real binary as a child; it is
+  # started with setsid so the whole tree shares one process group.
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+  own_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)
+  log "停止 mooncake_master (pid=$pid${pgid:+, pgid=$pgid})"
+  if [ -n "$pgid" ] && [ "$pgid" != "$own_pgid" ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+  else
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
   local i
-  for i in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-  kill -9 "$pid" 2>/dev/null || true
+  for i in $(seq 1 15); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    if [ -n "$pgid" ] && [ "$pgid" != "$own_pgid" ]; then
+      kill -KILL -- "-$pgid" 2>/dev/null || true
+    else
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
   rm -f "$DSV41_MOONCAKE_PID_FILE"
+  if port_open "$MASTER_HOST" "$MASTER_PORT"; then
+    log "⚠️ $DSV41_MOONCAKE_MASTER 仍有监听（可能是外部 master，未被停止）"
+  else
+    log "mooncake_master 已停止"
+  fi
 }
 
 cmd_status() {

@@ -26,16 +26,19 @@ export DSV41_PROJECT_ROOT
 # first, source the files, then restore the snapshot.
 _dsv41_env_backup=$(mktemp "${TMPDIR:-/tmp}/dsv41-env.XXXXXX")
 export -p | grep -E '^declare -x DSV41_[A-Za-z0-9_]+=' > "$_dsv41_env_backup" || true
-for _dsv41_cfg in \
-  "$DSV41_PROJECT_ROOT/config/dsv41.env" \
-  "$DSV41_PROJECT_ROOT/config/dsv41.local.env"; do
-  if [ -f "$_dsv41_cfg" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    . "$_dsv41_cfg"
-    set +a
-  fi
-done
+# DSV41_SKIP_CONFIG_FILES=1 ignores config/dsv41*.env (tests / emergency debugging).
+if [ "${DSV41_SKIP_CONFIG_FILES:-0}" != "1" ]; then
+  for _dsv41_cfg in \
+    "$DSV41_PROJECT_ROOT/config/dsv41.env" \
+    "$DSV41_PROJECT_ROOT/config/dsv41.local.env"; do
+    if [ -f "$_dsv41_cfg" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "$_dsv41_cfg"
+      set +a
+    fi
+  done
+fi
 if [ -s "$_dsv41_env_backup" ]; then
   set -a
   # shellcheck disable=SC1090

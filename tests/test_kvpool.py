@@ -28,6 +28,8 @@ def run_kvpool(*args: str, env: dict[str, str] | None = None) -> subprocess.Comp
         if not key.startswith("DSV41_")  # keep tests independent of local.env
     }
     full_env.update(env or {})
+    # Hermetic: ignore config/dsv41*.env so production values never leak in.
+    full_env["DSV41_SKIP_CONFIG_FILES"] = "1"
     return subprocess.run(
         ["bash", str(KVPOOL), *args],
         capture_output=True,

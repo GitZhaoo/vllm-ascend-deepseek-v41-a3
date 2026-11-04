@@ -279,6 +279,20 @@ export PYTHONPATH="$CANN/python/site-packages:$PYTHONPATH"
 # instances (required by the Mooncake pool, harmless otherwise).
 export PYTHONHASHSEED="$DSV41_PYTHONHASHSEED"
 
+# Environment probe:  DSV41_PROBE=1 bash scripts/serve.sh
+# Imports the stack with the exact serving environment (rootfs/container Python,
+# CANN, host driver libs), prints versions and the visible NPU count, and exits.
+# Must stay before the KV-pool bootstrap: probing must not start mooncake_master.
+if [ "${DSV41_PROBE:-0}" = "1" ]; then
+  exec "$PY" -c '
+import torch, torch_npu
+print("torch", torch.__version__, "torch_npu", torch_npu.__version__)
+print("npu_count", torch.npu.device_count())
+import vllm, vllm_ascend
+print("vllm", vllm.__version__, "vllm_ascend", getattr(vllm_ascend, "__version__", "?"))
+'
+fi
+
 # ---- external KV pool (Mooncake / AscendStoreConnector) --------------------
 # ensure: writes state/kvpool/mooncake.json and starts mooncake_master if the
 # configured master endpoint is not already served. Runs after the container
@@ -289,19 +303,6 @@ if [ "$DSV41_KV_POOL" = "1" ]; then
   KVPOOL_CFG=$(bash "$SELF_DIR/kvpool.sh" ensure)
   export MOONCAKE_CONFIG_PATH="$KVPOOL_CFG"
   KVPOOL_JSON=$(printf '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"%s","lookup_rpc_port":"0"}}' "$DSV41_MOONCAKE_BACKEND")
-fi
-
-# Environment probe:  DSV41_PROBE=1 bash scripts/serve.sh
-# Imports the stack with the exact serving environment (rootfs/container Python,
-# CANN, host driver libs), prints versions and the visible NPU count, and exits.
-if [ "${DSV41_PROBE:-0}" = "1" ]; then
-  exec "$PY" -c '
-import torch, torch_npu
-print("torch", torch.__version__, "torch_npu", torch_npu.__version__)
-print("npu_count", torch.npu.device_count())
-import vllm, vllm_ascend
-print("vllm", vllm.__version__, "vllm_ascend", getattr(vllm_ascend, "__version__", "?"))
-'
 fi
 
 # ---- compose arguments -----------------------------------------------------
