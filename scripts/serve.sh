@@ -120,6 +120,11 @@ if [ "${STOP:-0}" = "1" ]; then
   fi
   stop_router
   dsv41_cleanup_residual
+  if [ "$DSV41_KVPOOL_STOP_WITH_SERVE" = "1" ]; then
+    bash "$SELF_DIR/kvpool.sh" stop || true
+  elif [ "$DSV41_KV_POOL" = "1" ]; then
+    echo "[serve] mooncake_master 仍在运行；需要时: bash scripts/kvpool.sh stop"
+  fi
   echo "[serve] 已停"
   exit 0
 fi
@@ -141,6 +146,9 @@ if [ "${STATUS:-0}" = "1" ]; then
   fi
   curl -s --noproxy '*' --max-time 5 "http://127.0.0.1:$DSV41_PORT/health" \
     -o /dev/null -w "health: HTTP %{http_code}\n" 2>/dev/null || echo "health: 不可达"
+  if [ "$DSV41_KV_POOL" = "1" ]; then
+    bash "$SELF_DIR/kvpool.sh" status || true
+  fi
   exit 0
 fi
 
@@ -267,6 +275,22 @@ export LD_LIBRARY_PATH="$CANN/lib64:$CANN/lib64/plugin/opskernel:$CANN/lib64/plu
 export PATH="$CANN/bin:$PYTHON_HOME_DIR/bin:${PATH:-}"
 export PYTHONPATH="$CANN/python/site-packages:$PYTHONPATH"
 
+# Stable string hashing keeps prefix-cache keys reproducible across ranks and
+# instances (required by the Mooncake pool, harmless otherwise).
+export PYTHONHASHSEED="$DSV41_PYTHONHASHSEED"
+
+# ---- external KV pool (Mooncake / AscendStoreConnector) --------------------
+# ensure: writes state/kvpool/mooncake.json and starts mooncake_master if the
+# configured master endpoint is not already served. Runs after the container
+# hand-off, so with DSV41_RUNTIME=docker the master lives inside the container
+# (host network namespace → same endpoint for the host).
+KVPOOL_JSON=""
+if [ "$DSV41_KV_POOL" = "1" ]; then
+  KVPOOL_CFG=$(bash "$SELF_DIR/kvpool.sh" ensure)
+  export MOONCAKE_CONFIG_PATH="$KVPOOL_CFG"
+  KVPOOL_JSON=$(printf '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"%s","lookup_rpc_port":"0"}}' "$DSV41_MOONCAKE_BACKEND")
+fi
+
 # Environment probe:  DSV41_PROBE=1 bash scripts/serve.sh
 # Imports the stack with the exact serving environment (rootfs/container Python,
 # CANN, host driver libs), prints versions and the visible NPU count, and exits.
@@ -326,6 +350,9 @@ else
   ARGS+=(--data-parallel-size "$DSV41_DP" --port "$DSV41_PORT")
 fi
 [ -n "$DSV41_API_KEY" ] && ARGS+=(--api-key "$DSV41_API_KEY")
+if [ -n "$KVPOOL_JSON" ]; then
+  ARGS+=(--kv-transfer-config "$KVPOOL_JSON")
+fi
 [ "$DSV41_ENABLE_EXPERT_PARALLEL" = "1" ] && ARGS+=(--enable-expert-parallel)
 [ "$DSV41_ENABLE_PREFIX_CACHING" = "1" ] && ARGS+=(--enable-prefix-caching)
 [ "$DSV41_ENABLE_PROMPT_TOKENS_DETAILS" = "1" ] && ARGS+=(--enable-prompt-tokens-details)
@@ -338,6 +365,11 @@ fi
 
 # ---- launch ----------------------------------------------------------------
 echo "[serve] runtime=$DSV41_RUNTIME ROOTFS=$DSV41_ROOTFS instance=$DSV41_INSTANCE_ID offline=$DSV41_OFFLINE"
+if [ "$DSV41_KV_POOL" = "1" ]; then
+  echo "[serve] kv_pool=on master=$DSV41_MOONCAKE_MASTER segment=${DSV41_MOONCAKE_SEGMENT_SIZE}/card backend=$DSV41_MOONCAKE_BACKEND config=$MOONCAKE_CONFIG_PATH"
+else
+  echo "[serve] kv_pool=off (DSV41_KV_POOL=0)"
+fi
 echo "[serve] model=$DSV41_MODEL tp=$DSV41_TP dp=$DSV41_DP port=$DSV41_PORT served=$DSV41_SERVED_NAME"
 echo "[serve] api-key: $([ -n "$DSV41_API_KEY" ] && echo "已启用 (len=${#DSV41_API_KEY})" || echo "未启用 (仅限内网)")"
 echo "[serve] V2=$DSV41_USE_V2 DSpark K=$DSV41_SPEC_TOKENS FULL_DECODE_ONLY max_len=$DSV41_MAX_MODEL_LEN prompt_tokens_details=$DSV41_ENABLE_PROMPT_TOKENS_DETAILS"

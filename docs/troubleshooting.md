@@ -65,6 +65,41 @@ ROUTER_RESTART=1 bash scripts/serve.sh    # 只重启 router，不动 vLLM
 
 ---
 
+## 2.1 DP lockstep：一个大 prefill 拖慢所有流
+
+**现象**：只有 2–3 个请求，但所有流一起卡顿；`/metrics` 里
+`num_requests_running` 正常、`num_requests_waiting=0`，另一个 rank 的
+`Avg generation throughput` 掉到个位数 tok/s，而做 prefill 的 rank
+`Avg prompt throughput` 高达数万 tok/s。
+
+**实测证据**（2026-11-04，DP2×TP8）：
+
+```
+Engine 000 (rank0): Running 2 reqs, KV 7%,  generation 1.6 → 2.0 → 0.5 → 0.8 tok/s
+Engine 001 (rank1): Running 1 reqs, KV 30.7%, prompt 51,731 tok/s   ← 大 prompt prefill
+（prefill 结束后 rank0 立刻回到 146 tok/s）
+```
+
+**原因**：MoE DP 是 lockstep——两个 DP rank 每个调度步必须同步前进。
+rank1 每个 16K prefill chunk 都让 rank0 的 decode 步等待；一个 39 万 token
+的 prompt 会让另一个 rank 的交互流停顿数十秒。
+
+**缓解手段（按优先级）**：
+
+1. **外部 KV 池（默认开启）**：长文档第二次提问直接命中宿主内存，
+   不再重复 prefill——见 `docs/kv-pool.md`；
+2. **不要让巨型 prompt 与交互流量并行**：500K+ token 的请求单独时段/实例；
+3. **交互优先的部署可下调 `DSV41_MAX_NUM_BATCHED_TOKENS`**：实测 C=8
+   单前缀热缓存 8192 比 16384 快约 40%（705 vs 505 tok/s），代价是冷 prefill
+   场景变慢（双前缀 -25~-47%）；
+4. 交互式对话上下文控制在 ~64K 内：decode 本身也随上下文线性变慢。
+
+> 该版本（v0.30.0rc2）没有可关闭 lockstep 的引擎开关
+> （`enable_wave_coordination` 由 `is_moe` 固定为真），只能从负载形态、
+> 批次与缓存复用上规避。
+
+---
+
 ## 3. 清理与进程
 
 | 症状 | 原因 | 修复 |

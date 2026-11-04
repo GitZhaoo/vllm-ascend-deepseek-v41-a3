@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
-.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart smoke bench bench8 analyze test lint clean container-up container-down container-status container-shell container-recreate container-cmd probe
+.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart kvpool-start kvpool-stop kvpool-status smoke bench bench8 analyze test lint clean container-up container-down container-status container-shell container-recreate container-cmd probe
 
 help:
 	@echo "vllm-ascend-deepseek-v41-a3"
@@ -26,6 +26,9 @@ help:
 	@echo "  make watchdog-status watchdog 状态"
 	@echo "  make watchdog-stop   停止 watchdog（不影响服务）"
 	@echo "  make router-restart  只重启 prefix router（不动 vLLM）"
+	@echo "  make kvpool-status   外部 KV 池（Mooncake master）状态"
+	@echo "  make kvpool-start    只启动 Mooncake master（幂等）"
+	@echo "  make kvpool-stop     停止 Mooncake master（不影响 vLLM）"
 	@echo "  make doctor          只读预检（rootfs/权重/补丁/端口）"
 	@echo "  make smoke           冒烟测试"
 	@echo "  make bench           2K 吞吐压测"
@@ -90,6 +93,15 @@ watchdog-stop:
 
 router-restart:
 	ROUTER_RESTART=1 bash $(ROOT)/scripts/serve.sh
+
+kvpool-start:
+	bash $(ROOT)/scripts/kvpool.sh start
+
+kvpool-stop:
+	bash $(ROOT)/scripts/kvpool.sh stop
+
+kvpool-status:
+	bash $(ROOT)/scripts/kvpool.sh status
 
 smoke:
 	python3 $(ROOT)/tests/smoke_test.py

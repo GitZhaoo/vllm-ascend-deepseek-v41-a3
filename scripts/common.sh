@@ -96,6 +96,40 @@ export DSV41_API_KEY DSV41_SERVE_PID_FILE DSV41_WATCHDOG_PID_FILE DSV41_ROUTER_P
 export DSV41_DP_BASE_PORT DSV41_DP_SUPERVISOR_PORT
 export DSV41_RUNTIME DSV41_IMAGE DSV41_CONTAINER DSV41_STATE_DIR DSV41_INSTANCE_ID
 
+# ---- external KV pool (Mooncake / AscendStoreConnector) --------------------
+# Enabled by default: prefix-cache blocks spill into host memory so repeated
+# prefixes (long documents, multi-turn chat, shared prompts) are reused across
+# requests AND across DP ranks instead of being recomputed.
+#   DSV41_KV_POOL=0                     rollback to the previous behaviour
+#   DSV41_MOONCAKE_SEGMENT_SIZE=64GB    host RAM registered per card/die
+#                                       (16 dies here → 1 TiB pinned total)
+#   DSV41_MOONCAKE_MASTER=host:port     mooncake_master RPC endpoint
+#   DSV41_MOONCAKE_SSD_OFFLOAD=1        persistent tier (needs *_SSD_PATH),
+#                                       survives engine restarts
+# Memory is pinned while the engine runs and released when it exits; budget it
+# against the other tenants of a shared node. See docs/kv-pool.md.
+: "${DSV41_KV_POOL:=1}"
+: "${DSV41_KVPOOL_STATE_DIR:=$DSV41_STATE_DIR/kvpool}"
+: "${DSV41_MOONCAKE_MASTER:=127.0.0.1:50088}"
+: "${DSV41_MOONCAKE_METRICS_PORT:=9003}"
+: "${DSV41_MOONCAKE_SEGMENT_SIZE:=64GB}"
+: "${DSV41_MOONCAKE_LOCAL_BUFFER:=1GB}"
+: "${DSV41_MOONCAKE_BACKEND:=mooncake}"
+: "${DSV41_MOONCAKE_TENANT:=default}"
+: "${DSV41_MOONCAKE_SSD_OFFLOAD:=0}"
+: "${DSV41_MOONCAKE_SSD_PATH:=}"
+: "${DSV41_MOONCAKE_LOG:=$DSV41_RESULTS/mooncake_master.log}"
+: "${DSV41_MOONCAKE_PID_FILE:=$DSV41_PID_DIR/dsv41_mooncake.pid}"
+: "${DSV41_KVPOOL_STOP_WITH_SERVE:=0}"   # 1: STOP=1 also stops the master
+: "${DSV41_PYTHONHASHSEED:=0}"           # stable cache keys across ranks
+
+export DSV41_KV_POOL DSV41_KVPOOL_STATE_DIR DSV41_MOONCAKE_MASTER
+export DSV41_MOONCAKE_METRICS_PORT DSV41_MOONCAKE_SEGMENT_SIZE
+export DSV41_MOONCAKE_LOCAL_BUFFER DSV41_MOONCAKE_BACKEND DSV41_MOONCAKE_TENANT
+export DSV41_MOONCAKE_SSD_OFFLOAD DSV41_MOONCAKE_SSD_PATH
+export DSV41_MOONCAKE_LOG DSV41_MOONCAKE_PID_FILE DSV41_KVPOOL_STOP_WITH_SERVE
+export DSV41_PYTHONHASHSEED
+
 # ---- helpers ---------------------------------------------------------------
 
 # Health checks and local API calls must never go through a corporate proxy.

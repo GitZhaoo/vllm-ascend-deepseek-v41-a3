@@ -32,6 +32,11 @@
   默认的 `cost` 策略以 token 为单位给各 rank 打分（未命中 prompt + prefill 排队量 +
   KV 饱和罚分），不再只看请求数，`DSV41_ROUTER_POLICY=legacy` 可回退。详见
   [`docs/router.md`](docs/router.md)。
+- **外部 KV 池（默认开启，Mooncake / AscendStoreConnector）**：prefix cache 的
+  KV block 扩展进宿主内存（默认 64GB/卡，16 die ≈ 1 TiB ≈ 显存 KV 的 9 倍），
+  长文档 / 多轮对话 / 共享 system prompt 跨请求、跨 DP rank 命中，避免重复
+  prefill；`DSV41_KV_POOL=0` 可一键回滚。详见
+  [`docs/kv-pool.md`](docs/kv-pool.md)。
 - **日志分析**：`scripts/analyze_serve_log.py` 从 serve 日志量化输出 tok/s 的停顿占比、
   两个 rank 的 lockstep 耦合、KV 饱和，用于前后对比（`docs/performance.md` 第 7 节）。
 - **无人值守**：`watchdog.sh` 轮询 `/health`，宽限期 + 自动重启 + 日志轮转。
@@ -289,6 +294,7 @@ curl --noproxy '*' http://127.0.0.1:8021/v1/chat/completions \
 | [deployment.md](docs/deployment.md) | 从零到可服务的完整步骤与校验点（rootfs 直跑） |
 | [architecture.md](docs/architecture.md) | rootfs 隔离、DP/TP 进程拓扑、端口与 PID |
 | [performance.md](docs/performance.md) | 实测吞吐、显存模型、每个参数的收益与代价 |
+| [kv-pool.md](docs/kv-pool.md) | 外部 KV 池（Mooncake / AscendStoreConnector）：容量、内存预算、启用与回滚 |
 | [patches.md](docs/patches.md) | 4 个补丁、6 个 gate、为什么默认值必须是 1 |
 | [troubleshooting.md](docs/troubleshooting.md) | 症状 → 原因 → 修复 |
 | [api.md](docs/api.md) | OpenAI 兼容接口、SDK、Claude Code |

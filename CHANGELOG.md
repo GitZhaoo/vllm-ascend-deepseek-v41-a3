@@ -11,6 +11,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   KV 饱和罚分），周期性抓取 `/metrics` 的 `vllm:kv_cache_usage_perc` /
   `vllm:num_requests_waiting`；`DSV41_ROUTER_POLICY=legacy` 可回退到请求数策略。
   新增 `DSV41_ROUTER_KV_HIGH|SAT_PENALTY|PREFILL_WEIGHT|LOAD_INTERVAL`。
+- **外部 KV 池（默认开启）**：AscendStoreConnector + Mooncake，把 prefix cache
+  扩展到宿主内存（默认 64GB/卡；16 die ≈ 1 TiB ≈ 11.6M tokens/卡，约显存 KV 的 9 倍）。
+  跨请求 / 跨 DP rank 复用长文档与多轮前缀，减少重复 prefill（也就减少 DP lockstep
+  停顿）。`scripts/kvpool.sh` 管理 master 生命周期；`DSV41_KV_POOL=0` 一键回滚。
+  另固定 `PYTHONHASHSEED=0` 保证缓存 key 跨 rank 一致。详见 `docs/kv-pool.md`。
 - `/router/stats` 新增 `policy`、`inflight_tokens`、`pending_prefill`、`kv_usage`、
   `waiting`、`spills`、`sat_avoid`、`digest_evicted`、`digest_resets`。
 - `scripts/analyze_serve_log.py`（`make analyze LOG=...`）：只读 serve 日志分析，
