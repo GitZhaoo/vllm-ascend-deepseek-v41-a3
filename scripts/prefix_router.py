@@ -329,40 +329,52 @@ class Router:
         self.sticky.move_to_end(body_key)
         while len(self.sticky) > MAX_STICKY:
             self.sticky.popitem(last=False)
+        # Reserve the slot synchronously so concurrent requests that decide in the
+        # same event-loop tick see the incremented count and spread across ranks.
+        # (Without this, N simultaneous requests all observe active==0 and pick
+        # the first rank; the counter was only bumped later in proxy().)
+        self.ranks[choice].active += 1
         return choice
 
-    async def route(self, request: web.Request, body: bytes) -> int:
+    async def route(self, request: web.Request, body: bytes) -> tuple[int, bool]:
         try:
             data = json.loads(body)
         except Exception:  # noqa: BLE001
-            return 0
+            return 0, False
         payload = self._tokenize_payload(data)
         if payload is None:
-            return 0
+            return 0, False
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
         tokens = await self._tokenize(payload, headers)
         matched = [0] * len(self.ranks)
         if tokens:
             digests = prefix_digests(tokens, self.block_size)
             matched = [rank.matched_blocks(digests) for rank in self.ranks]
-        return self._choose_rank(self._body_key(payload), matched)
+        # routed -> _choose_rank already reserved active (+1)
+        return self._choose_rank(self._body_key(payload), matched), True
 
     # ---- proxies ---------------------------------------------------------
     async def proxy(self, request: web.Request, forced_rank: int | None = None) -> web.StreamResponse:
         body = await request.read()
         rank_index = forced_rank
+        reserved = False
         if rank_index is None and request.path in COMPLETION_PATHS and request.method == "POST":
-            rank_index = await self.route(request, body)
+            rank_index, reserved = await self.route(request, body)
         if rank_index is None:
             rank_index = 0
         headers = [(k, v) for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP]
         order = [rank_index] + [r.index for r in self.ranks if r.index != rank_index]
         last_error: Exception | None = None
-        for idx in order:
+        for pos, idx in enumerate(order):
             rank = self.ranks[idx]
+            # pos==0 且 reserved: route() 已在决策时预占 active, 这里不再重复 +1
+            already = pos == 0 and reserved
             if not rank.healthy and len(order) > 1:
+                if already:
+                    rank.active -= 1   # 释放预占
                 continue
-            rank.active += 1
+            if not already:
+                rank.active += 1
             self.stats["requests"] += 1
             try:
                 return await self._forward(request, body, rank, headers)
