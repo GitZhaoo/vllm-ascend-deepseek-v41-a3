@@ -300,8 +300,15 @@ fi
 # (host network namespace → same endpoint for the host).
 KVPOOL_JSON=""
 if [ "$DSV41_KV_POOL" = "1" ]; then
-  KVPOOL_CFG=$(bash "$SELF_DIR/kvpool.sh" ensure)
+  if ! KVPOOL_CFG=$(bash "$SELF_DIR/kvpool.sh" ensure); then
+    echo "[serve] ❌ 外部 KV 池未就绪，已中止启动（修好容量/配置后重试，或 DSV41_KV_POOL=0 回滚）" >&2
+    exit 1
+  fi
   export MOONCAKE_CONFIG_PATH="$KVPOOL_CFG"
+  # Bound HIXL connect/transfer retries (default 60 s blocks a request for a
+  # minute when a peer segment is unreachable).
+  export ASCEND_CONNECT_TIMEOUT="${ASCEND_CONNECT_TIMEOUT:-$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS}"
+  export ASCEND_TRANSFER_TIMEOUT="${ASCEND_TRANSFER_TIMEOUT:-$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS}"
   KVPOOL_JSON=$(printf '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"%s","lookup_rpc_port":"0"}}' "$DSV41_MOONCAKE_BACKEND")
 fi
 

@@ -3,6 +3,27 @@
 All notable changes to this deployment project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] — 2026-11-05
+
+### Fixed
+
+- **KV 池容量**：默认 `DSV41_MOONCAKE_SEGMENT_SIZE` 64GB → 32GB。1 TiB（64GB × 16）
+  在 2 TiB 节点上会让 worker 的 `HcommMemReg` 失败（ret:19 →
+  `Initialize mooncake failed` ret=-600），且失败点在模型加载之后。
+- **启动预检**：新增 `kvpool.sh check-capacity`（`make kvpool-check`），要求
+  池 ≤ MemTotal 40% 且保留 256 GiB，不足时直接拒绝启动并给出建议值。
+- **写路径本地化**：`preferred_segment` 默认 true，避免 master 把 block 分配到
+  别的 rank 的 segment（跨卡 HIXL 拷贝在本机 A3 上失败并杀死 worker）。
+- **超时收紧**：`ASCEND_CONNECT_TIMEOUT` / `ASCEND_TRANSFER_TIMEOUT` 默认 10 s
+  （mooncake 默认 60 s），失败时快速降级而不是卡住请求。
+
+### Known issue
+
+- 本机 A3 910C 的跨卡 HIXL 不可用（`halDeviceDisableP2P ret:17`）：任何跨 rank
+  的 block 读/写都会让 worker 退出，且崩溃后 HIXL 无法重新初始化。因此
+  `config/dsv41.local.env` 已设 `DSV41_KV_POOL=0`；代码默认仍为 1，驱动修好后
+  改回即可。详见 `docs/kv-pool.md` 3.1。
+
 ## [0.2.0] — 2026-11-04
 
 ### Added
@@ -12,7 +33,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `vllm:num_requests_waiting`；`DSV41_ROUTER_POLICY=legacy` 可回退到请求数策略。
   新增 `DSV41_ROUTER_KV_HIGH|SAT_PENALTY|PREFILL_WEIGHT|LOAD_INTERVAL`。
 - **外部 KV 池（默认开启）**：AscendStoreConnector + Mooncake，把 prefix cache
-  扩展到宿主内存（默认 64GB/卡；16 die ≈ 1 TiB ≈ 11.6M tokens/卡，约显存 KV 的 9 倍）。
+  扩展到宿主内存（默认 32GB/卡；16 die ≈ 512 GiB ≈ 5.8M tokens/卡，约显存 KV 的 4.6 倍）。
+  启动前由 `kvpool.sh check-capacity` 校验内存预算：池 ≤ MemTotal 40% 且保留
+  256 GiB；超过即拒绝启动（64GB/卡 的 1 TiB 在本机实测会触发 HcommMemReg
+  ret:19 / `Initialize mooncake failed` ret=-600）。
   跨请求 / 跨 DP rank 复用长文档与多轮前缀，减少重复 prefill（也就减少 DP lockstep
   停顿）。`scripts/kvpool.sh` 管理 master 生命周期；`DSV41_KV_POOL=0` 一键回滚。
   另固定 `PYTHONHASHSEED=0` 保证缓存 key 跨 rank 一致。详见 `docs/kv-pool.md`。

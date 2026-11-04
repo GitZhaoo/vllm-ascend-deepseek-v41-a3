@@ -104,18 +104,35 @@ export DSV41_RUNTIME DSV41_IMAGE DSV41_CONTAINER DSV41_STATE_DIR DSV41_INSTANCE_
 # prefixes (long documents, multi-turn chat, shared prompts) are reused across
 # requests AND across DP ranks instead of being recomputed.
 #   DSV41_KV_POOL=0                     rollback to the previous behaviour
-#   DSV41_MOONCAKE_SEGMENT_SIZE=64GB    host RAM registered per card/die
-#                                       (16 dies here → 1 TiB pinned total)
+#   DSV41_MOONCAKE_SEGMENT_SIZE=32GB    host RAM registered per card/die
+#                                       (16 dies here → 512 GiB pinned total)
 #   DSV41_MOONCAKE_MASTER=host:port     mooncake_master RPC endpoint
 #   DSV41_MOONCAKE_SSD_OFFLOAD=1        persistent tier (needs *_SSD_PATH),
 #                                       survives engine restarts
 # Memory is pinned while the engine runs and released when it exits; budget it
 # against the other tenants of a shared node. See docs/kv-pool.md.
+#
+# 32GB × 16 dies = 512 GiB is the largest default that leaves headroom on this
+# 2 TiB node: the engine itself touches several hundred GiB of host memory
+# during startup, and 64GB × 16 (1 TiB) made HcommMemReg fail (ret:19) inside
+# the workers. kvpool.sh check-capacity enforces the budget before launch.
 : "${DSV41_KV_POOL:=1}"
 : "${DSV41_KVPOOL_STATE_DIR:=$DSV41_STATE_DIR/kvpool}"
 : "${DSV41_MOONCAKE_MASTER:=127.0.0.1:50088}"
 : "${DSV41_MOONCAKE_METRICS_PORT:=9003}"
-: "${DSV41_MOONCAKE_SEGMENT_SIZE:=64GB}"
+: "${DSV41_MOONCAKE_SEGMENT_SIZE:=32GB}"
+# Write into the writer's own segment. Without this the master may place a block
+# on another rank's host segment, and the copy becomes a cross-NPU HIXL transfer
+# that fails on this A3 node (halDeviceDisableP2P ret:17, 60 s timeouts, then a
+# dead worker). Cross-rank reads are rare because the prefix router pins a
+# prefix to one rank.
+: "${DSV41_MOONCAKE_PREFERRED_SEGMENT:=1}"
+# Bound HIXL connect/transfer attempts so a cross-rank miss degrades in seconds
+# instead of hanging the request for the 60 s default.
+: "${DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS:=10000}"
+: "${DSV41_KVPOOL_MIN_FREE_GIB:=256}"    # keep this much RAM free for the engine
+: "${DSV41_KVPOOL_MAX_MEM_PCT:=40}"      # never let the pool exceed this % of RAM
+: "${DSV41_MEMINFO_FILE:=/proc/meminfo}" # override for tests/containers
 : "${DSV41_MOONCAKE_LOCAL_BUFFER:=1GB}"
 : "${DSV41_MOONCAKE_BACKEND:=mooncake}"
 : "${DSV41_MOONCAKE_TENANT:=default}"
@@ -130,6 +147,8 @@ export DSV41_KV_POOL DSV41_KVPOOL_STATE_DIR DSV41_MOONCAKE_MASTER
 export DSV41_MOONCAKE_METRICS_PORT DSV41_MOONCAKE_SEGMENT_SIZE
 export DSV41_MOONCAKE_LOCAL_BUFFER DSV41_MOONCAKE_BACKEND DSV41_MOONCAKE_TENANT
 export DSV41_MOONCAKE_SSD_OFFLOAD DSV41_MOONCAKE_SSD_PATH
+export DSV41_KVPOOL_MIN_FREE_GIB DSV41_KVPOOL_MAX_MEM_PCT DSV41_MEMINFO_FILE
+export DSV41_MOONCAKE_PREFERRED_SEGMENT DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS
 export DSV41_MOONCAKE_LOG DSV41_MOONCAKE_PID_FILE DSV41_KVPOOL_STOP_WITH_SERVE
 export DSV41_PYTHONHASHSEED
 

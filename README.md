@@ -32,11 +32,13 @@
   默认的 `cost` 策略以 token 为单位给各 rank 打分（未命中 prompt + prefill 排队量 +
   KV 饱和罚分），不再只看请求数，`DSV41_ROUTER_POLICY=legacy` 可回退。详见
   [`docs/router.md`](docs/router.md)。
-- **外部 KV 池（默认开启，Mooncake / AscendStoreConnector）**：prefix cache 的
-  KV block 扩展进宿主内存（默认 64GB/卡，16 die ≈ 1 TiB ≈ 显存 KV 的 9 倍），
+- **外部 KV 池（Mooncake / AscendStoreConnector，本机暂由 local.env 关闭）**：prefix cache 的
+  KV block 扩展进宿主内存（默认 32GB/卡，16 die ≈ 512 GiB ≈ 显存 KV 的 4.6 倍），
   长文档 / 多轮对话 / 共享 system prompt 跨请求、跨 DP rank 命中，避免重复
-  prefill；`DSV41_KV_POOL=0` 可一键回滚。详见
-  [`docs/kv-pool.md`](docs/kv-pool.md)。
+  prefill；`DSV41_KV_POOL=0` 可一键回滚。**注意**：A3 910C 当前驱动的跨卡
+  HIXL 不可用（`halDeviceDisableP2P ret:17`），本机已在
+  `config/dsv41.local.env` 关闭该特性；驱动修好后改回 1 即可。详见
+  [`docs/kv-pool.md`](docs/kv-pool.md) 第 3.1 节。
 - **日志分析**：`scripts/analyze_serve_log.py` 从 serve 日志量化输出 tok/s 的停顿占比、
   两个 rank 的 lockstep 耦合、KV 饱和，用于前后对比（`docs/performance.md` 第 7 节）。
 - **无人值守**：`watchdog.sh` 轮询 `/health`，宽限期 + 自动重启 + 日志轮转。

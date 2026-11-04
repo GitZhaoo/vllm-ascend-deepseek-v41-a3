@@ -54,9 +54,66 @@ rootfs_python() {
   echo "$home/bin/python3.12"
 }
 
+# ---- capacity preflight ----------------------------------------------------
+# The pool pins host RAM: segment_size × (TP × DP) stays locked while the engine
+# runs. Asking for more than the node can keep free makes the connector fail
+# inside the workers (HcommMemReg ret:19 → "Initialize mooncake failed", ret=-600)
+# only after the model has loaded, so the budget is checked before launch.
+meminfo_kib() {
+  awk -v key="$1" '$1 == key ":" { printf "%d", $2; found = 1 } END { exit(found ? 0 : 1) }' "$DSV41_MEMINFO_FILE"
+}
+
+segment_gib() {
+  awk -v v="$DSV41_MOONCAKE_SEGMENT_SIZE" 'BEGIN {
+    if (v ~ /^[0-9]+$/) { printf "%d", v / 1073741824; exit }
+    if (v ~ /^[0-9]+[Gg]([Ii])?[Bb]$/) { sub(/[Gg]([Ii])?[Bb]$/, "", v); printf "%d", v; exit }
+    if (v ~ /^[0-9]+[Mm]([Ii])?[Bb]$/) { sub(/[Mm]([Ii])?[Bb]$/, "", v); printf "%d", v / 1024; exit }
+    printf "0"
+  }'
+}
+
+cmd_check_capacity() {
+  local seg ranks required avail total reserve cap limit suggest
+  seg=$(segment_gib)
+  [ "$seg" -gt 0 ] 2>/dev/null || die "无效的 DSV41_MOONCAKE_SEGMENT_SIZE=$DSV41_MOONCAKE_SEGMENT_SIZE（示例: 32GB）"
+  ranks=$((DSV41_TP * DSV41_DP))
+  [ "$ranks" -gt 0 ] || die "DSV41_TP × DSV41_DP 必须大于 0（当前 $DSV41_TP × $DSV41_DP）"
+  required=$((seg * ranks))
+
+  local avail_kib total_kib
+  avail_kib=$(meminfo_kib MemAvailable) || die "读不到 MemAvailable（DSV41_MEMINFO_FILE=$DSV41_MEMINFO_FILE）"
+  total_kib=$(meminfo_kib MemTotal) || die "读不到 MemTotal（DSV41_MEMINFO_FILE=$DSV41_MEMINFO_FILE）"
+  avail=$((avail_kib / 1048576))
+  total=$((total_kib / 1048576))
+  reserve=$DSV41_KVPOOL_MIN_FREE_GIB
+  cap=$((total * DSV41_KVPOOL_MAX_MEM_PCT / 100))
+
+  limit=$cap
+  if [ $((avail - reserve)) -lt "$limit" ]; then
+    limit=$((avail - reserve))
+  fi
+  if [ "$required" -le "$limit" ]; then
+    log "容量校验通过：${seg}GB/卡 × ${ranks} = ${required} GiB（MemTotal ${total} GiB，可用 ${avail} GiB，上限 ${cap} GiB，保留 ${reserve} GiB）"
+    return 0
+  fi
+
+  suggest=$((limit / ranks / 4 * 4))
+  [ "$suggest" -ge 4 ] || suggest=4
+  {
+    log "❌ KV 池容量不足：需要 ${required} GiB（${seg}GB/卡 × ${ranks} 卡）"
+    log "   MemTotal ${total} GiB，MemAvailable ${avail} GiB，允许上限 ${limit} GiB（池 ≤ ${DSV41_KVPOOL_MAX_MEM_PCT}% 内存且保留 ${reserve} GiB）"
+    log "   引擎启动后还会占用数百 GiB 宿主内存，注册阶段才失败会白等一轮模型加载。"
+    log "   修复：把 DSV41_MOONCAKE_SEGMENT_SIZE 降到 ${suggest}GB（或 DSV41_KV_POOL=0 关闭外部池）后重启。"
+  } >&2
+  return 1
+}
+
 render_config() {
   mkdir -p "$DSV41_KVPOOL_STATE_DIR"
-  local ssd_flag=false ssd_path=""
+  local ssd_flag=false ssd_path="" pref_flag=false
+  if [ "$DSV41_MOONCAKE_PREFERRED_SEGMENT" = "1" ]; then
+    pref_flag=true
+  fi
   if [ "$DSV41_MOONCAKE_SSD_OFFLOAD" = "1" ]; then
     [ -n "$DSV41_MOONCAKE_SSD_PATH" ] || die "DSV41_MOONCAKE_SSD_OFFLOAD=1 需要 DSV41_MOONCAKE_SSD_PATH"
     ssd_flag=true
@@ -70,7 +127,7 @@ render_config() {
   "master_server_address": "$DSV41_MOONCAKE_MASTER",
   "global_segment_size": "$DSV41_MOONCAKE_SEGMENT_SIZE",
   "local_buffer_size": "$DSV41_MOONCAKE_LOCAL_BUFFER",
-  "preferred_segment": false,
+  "preferred_segment": $pref_flag,
   "prefer_alloc_in_same_node": true,
   "enable_ssd_offload": $ssd_flag,
   "ssd_offload_path": "$ssd_path",
@@ -187,6 +244,7 @@ cmd_status() {
 
 cmd_ensure() {
   [ "$DSV41_KV_POOL" = "1" ] || die "DSV41_KV_POOL=0（ensure 只在启用时调用）"
+  cmd_check_capacity || die "容量预检未通过，未启动引擎（改 DSV41_MOONCAKE_SEGMENT_SIZE 或 DSV41_KV_POOL=0）"
   render_config >/dev/null
   cmd_start
   log "✅ kv pool 就绪 config=$MOONCAKE_CFG master=$DSV41_MOONCAKE_MASTER segment=${DSV41_MOONCAKE_SEGMENT_SIZE}/card"
@@ -205,18 +263,23 @@ DSV41_MOONCAKE_BACKEND=$DSV41_MOONCAKE_BACKEND
 DSV41_MOONCAKE_TENANT=$DSV41_MOONCAKE_TENANT
 DSV41_MOONCAKE_SSD_OFFLOAD=$DSV41_MOONCAKE_SSD_OFFLOAD
 DSV41_MOONCAKE_SSD_PATH=$DSV41_MOONCAKE_SSD_PATH
+DSV41_MOONCAKE_PREFERRED_SEGMENT=$DSV41_MOONCAKE_PREFERRED_SEGMENT
+DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS=$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS
+DSV41_KVPOOL_MIN_FREE_GIB=$DSV41_KVPOOL_MIN_FREE_GIB
+DSV41_KVPOOL_MAX_MEM_PCT=$DSV41_KVPOOL_MAX_MEM_PCT
 DSV41_KVPOOL_STATE_DIR=$DSV41_KVPOOL_STATE_DIR
 DSV41_MOONCAKE_CONFIG=$MOONCAKE_CFG
 ENV
 }
 
 case "${1:-}" in
-  start)         cmd_start ;;
-  stop)          cmd_stop ;;
-  status)        cmd_status ;;
-  ensure)        cmd_ensure ;;
-  render-config) render_config ;;
-  print-env)     cmd_print_env ;;
+  start)          cmd_start ;;
+  stop)           cmd_stop ;;
+  status)         cmd_status ;;
+  check-capacity) cmd_check_capacity ;;
+  ensure)         cmd_ensure ;;
+  render-config)  render_config ;;
+  print-env)      cmd_print_env ;;
   *)
     cat >&2 <<USAGE
 用法: bash scripts/kvpool.sh <command>
@@ -224,7 +287,8 @@ case "${1:-}" in
   start         启动 mooncake_master（幂等；已有 master 则复用）
   stop          停止本脚本启动的 mooncake_master
   status        查看 master / 配置状态
-  ensure        写配置并按需启动 master（serve.sh 调用）
+  check-capacity 校验宿主内存预算（不启动任何进程）
+  ensure        校验预算 + 写配置 + 按需启动 master（serve.sh 调用）
   render-config 生成 mooncake.json 并打印路径
   print-env     打印生效配置
 USAGE
