@@ -54,7 +54,13 @@ rootfs、补丁和启动参数，只改变 DP 的端口布局。
 | vLLM 0.30.0 源码 + 预编译 rust/C 扩展 | `/vllm-workspace/vllm` |
 | vLLM Ascend 0.30.0rc2 源码 + `.so` | `/vllm-workspace/vllm-ascend` |
 
-本方案不用容器运行时：
+本方案默认不用容器运行时（`DSV41_RUNTIME=native`）。离线 / 旧 glibc 宿主改用
+`DSV41_RUNTIME=docker`：镜像里的二进制在宿主 glibc 2.28 上无法运行，所以服务跑在
+由本机镜像创建的长驻容器里（`--net=host --ipc=host --pid=host`），控制面脚本
+（watchdog / kill_vllm / doctor）仍在宿主执行，因为共享 PID 命名空间后它们能直接看到容器内进程。
+详见 [`offline-deployment.md`](offline-deployment.md)。
+
+native 运行时：
 
 1. 直接按 OCI 层解包到宿主目录；
 2. 通过 `PYTHONHOME` / `PYTHONPATH` / `LD_LIBRARY_PATH` / `ASCEND_HOME_PATH`

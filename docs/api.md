@@ -107,6 +107,24 @@ DeepSeek-V4.1 是 reasoning 模型。服务端 `--reasoning-parser deepseek_v41`
 
 一个 token budget 的建议：`max_tokens >= 1024`，否则可能只输出思考内容就截断。
 
+### usage 与前缀缓存命中（prompt_tokens_details）
+
+服务以 `--enable-prompt-tokens-details` 启动（`DSV41_ENABLE_PROMPT_TOKENS_DETAILS=1`，默认开启），
+响应的 `usage` 里会带上命中前缀缓存的 token 数：
+
+```json
+"usage": {
+  "prompt_tokens": 2048,
+  "completion_tokens": 256,
+  "total_tokens": 2304,
+  "prompt_tokens_details": {"cached_tokens": 1920}
+}
+```
+
+流式请求需要 `"stream_options": {"include_usage": true}` 才会在最后一个 chunk 里返回 usage。
+首次请求 `cached_tokens` 为 0（或很小），同一前缀的后续请求应接近前缀长度（按 128 token 的
+block 对齐），可用来确认 prefix cache 与 router 的前缀亲和是否生效。
+
 ---
 
 ## 3. Claude Code（通过 CLIProxyAPI，可选）

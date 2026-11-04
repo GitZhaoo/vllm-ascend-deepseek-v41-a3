@@ -47,8 +47,9 @@ tail -n 200 logs/serve_*.log
 | `/health` 503，但 8022/8023 各自 200 | router 健康轮询尚未完成 | 等 5 s；看 `logs/router.log` |
 | `/router/stats` 401 | stats 默认要求 `DSV41_API_KEY` | 带 `Authorization: Bearer ...` |
 | `cached_prefix_digests=0` | 请求 <128 token / router 刚重启 / 无 KV 事件 | 发 >128 token 请求；确认 5557/5558 |
-| 路由长期只打一个 rank | 热前缀 + skew 太小 | 调大 `DSV41_ROUTER_MAX_SKEW` 或拆分前缀 |
-| 两 rank 流量不均但健康 | 前缀亲和策略的正常代价 | 需要纯吞吐可回退 `DSV41_LB_MODE=internal` |
+| 路由长期只打一个 rank | 热前缀；或 `legacy` 策略下 skew 太小 | 默认 `cost` 策略会按 token / KV 负载分流；`legacy` 下调大 `DSV41_ROUTER_MAX_SKEW` |
+| 两 rank 流量不均但健康 | 前缀亲和的正常代价 | 看 `/router/stats` 的 `inflight_tokens` / `kv_usage`；需要纯吞吐可回退 `DSV41_LB_MODE=internal` |
+| 总输出 tok/s 大幅波动、`Running` 不低但 `generation throughput` 只有个位数 | DP+EP lockstep：一个 rank 的长 prefill 分块拖慢两个 rank 的 decode；或一个 rank KV 被打满 | `python3 scripts/analyze_serve_log.py logs/serve_*.log`，对照 `docs/performance.md` 第 7 节 |
 | router 起不来 | 缺 aiohttp/pyzmq/msgspec | 用 rootfs Python 启动（serve.sh 已保证）或 `pip install -r requirements.txt` |
 
 router 诊断：
@@ -69,8 +70,8 @@ ROUTER_RESTART=1 bash scripts/serve.sh    # 只重启 router，不动 vLLM
 | 症状 | 原因 | 修复 |
 |---|---|---|
 | `pgrep -f "Worker_DP"` 杀错进程 | 命令行自身被匹配 | 用 `ps -eo comm` 匹配 `VLLM::` 前缀；脚本已如此实现 |
-| 停服务后端口仍被占用 | ApiServer/EngineCore 子进程残留 | `bash scripts/kill_vllm.sh` |
-| NPU 仍显示 `VLLMWorker_DP` | worker 未随主进程退出 | `bash scripts/kill_vllm.sh`（内部循环调用 `npu-smi`） |
+| 停服务后端口仍被占用 | ApiServer/EngineCore 子进程残留 | `bash scripts/kill_vllm.sh`（只清理本部署的进程，含孤儿 worker） |
+| NPU 仍显示 `VLLMWorker_DP` | 可能是本部署的残留，也可能是同机其它模型 | 先 `kill_vllm.sh`；仍在的多半不属于本部署（脚本刻意不动它们）。确认整机只跑本服务时才用 `kill_vllm.sh --all` |
 | 端口释放但 HBM 未释放 | 进程处于不可中断状态 | 等待或重启节点；确认没有 NFS 卡死 |
 | watchdog 把服务反复拉起 | 手工 `STOP=1` 时 watchdog 仍在运行 | 先 `watchdog.sh stop` 再停服务 |
 
@@ -95,6 +96,23 @@ grep -E ':15B5|:15B6' /proc/net/tcp   # 5557/5558
 | rootfs 树缺少 `.so` | 镜像层缺失或解包异常 | `setup_rootfs.sh --force`；检查 `<rootfs>/.dsv41-image` |
 | `git apply` 冲突 | 补丁与镜像版本不匹配 | `apply_patches.sh check` 定位；重新生成补丁 |
 | 回滚失败 | rootfs 不是 git 工作树 | 重新解包 rootfs |
+
+---
+
+## 4b. docker 运行时（离线 / 旧 glibc 宿主）
+
+| 症状 | 原因 | 修复 |
+|---|---|---|
+| `version 'GLIBC_2.3x' not found`（直接用 rootfs 跑） | 宿主 glibc 2.28 < 镜像的 2.35 | 改用 `DSV41_RUNTIME=docker`（`docs/offline-deployment.md`） |
+| `container.sh up`：`本机没有镜像` | 镜像未加载或 tag 不同 | `docker images`；`docker load -i`；或设置 `DSV41_IMAGE` |
+| `缺少必需的挂载源 …driver/lib64 / npu-smi` | 宿主驱动路径不在默认位置 | 确认 `/usr/local/Ascend/driver/lib64`、`/usr/local/bin/npu-smi` 存在 |
+| `DSV41_PID_DIR 不能是 /tmp` | docker 运行时要把 pid 目录挂进容器 | `DSV41_PID_DIR=/run/dsv41` |
+| `容器 dsv41 未运行` | 容器被停止/删除 | `bash scripts/container.sh up` |
+| 改了挂载/参数没生效 | 容器是创建时固化的 | `bash scripts/container.sh recreate`（补丁会自动重新应用） |
+| `DSV41_PROBE=1 bash scripts/serve.sh` 报 `ImportError` / `libXXX.so` | 驱动库未挂载或环境缺失 | 看报错库名；`container.sh shell` 里 `ldd`；必要时 `DSV41_CONTAINER_SOURCE_ENV=1` |
+| `Free memory on device … less than desired GPU memory utilization` | 同机其它进程占用了这些 die 的 HBM | 停掉占用者，或调低 `DSV41_GPU_MEM_UTIL` |
+| `serve.sh run` 里 Ctrl-C 没停掉服务 | docker exec 不转发信号（非 TTY 时） | 在交互终端运行（自动 `-it`），或另开终端 `STOP=1 bash scripts/serve.sh` |
+| 重启宿主后服务没起来 | 未启用 systemd 单元 | `systemctl enable --now dsv41-container` |
 
 ---
 

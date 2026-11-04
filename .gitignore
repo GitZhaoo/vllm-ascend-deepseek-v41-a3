@@ -1,5 +1,6 @@
 # Outputs and local state
 logs/
+state/
 *.log
 models/
 *.layers/
@@ -18,3 +19,4 @@ config/dsv41.local.env
 .DS_Store
 .idea/
 .vscode/
+.tmp
