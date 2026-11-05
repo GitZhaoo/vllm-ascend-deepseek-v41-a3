@@ -277,7 +277,16 @@ export PYTHONPATH="$CANN/python/site-packages:$PYTHONPATH"
 
 # Stable string hashing keeps prefix-cache keys reproducible across ranks and
 # instances (required by the Mooncake pool, harmless otherwise).
-export PYTHONHASHSEED="$DSV41_PYTHONHASHSEED"
+# PYTHONHASHSEED is only needed by the Mooncake KV pool (reproducible cache keys
+# across ranks). With the pool off it stays unset so interpreter behaviour
+# matches the pre-pool baseline: vLLM derives the prefix-cache root seed from
+# PYTHONHASHSEED when present, so pinning it changes hash-derived state for the
+# whole engine even with DSV41_KV_POOL=0.
+if [ "$DSV41_KV_POOL" = "1" ] && [ -n "${DSV41_PYTHONHASHSEED:-}" ]; then
+  export PYTHONHASHSEED="$DSV41_PYTHONHASHSEED"
+else
+  unset PYTHONHASHSEED 2>/dev/null || true
+fi
 
 # Environment probe:  DSV41_PROBE=1 bash scripts/serve.sh
 # Imports the stack with the exact serving environment (rootfs/container Python,
@@ -305,7 +314,20 @@ if [ "$DSV41_KV_POOL" = "1" ]; then
     exit 1
   fi
   export MOONCAKE_CONFIG_PATH="$KVPOOL_CFG"
-  # Bound HIXL connect/transfer retries (default 60 s blocks a request for a
+  # Route the store through its own transfer path instead of the engine-global
+  # HIXL TE: on this A3 node the global-TE path fails cross-rank copies
+  # (halDeviceDisableP2P ret:17) and AdxlEngine init fails outright when a vLLM
+  # engine is already holding the devices. An empty JSON object is enough to
+  # flip MooncakeBackend onto the store-independent path (see its __init__).
+  if [ -z "${ASCEND_GLOBAL_RESOURCE_CONFIG:-}" ]; then
+    export ASCEND_GLOBAL_RESOURCE_CONFIG='{}'
+  fi
+  # A3 fabric-mem path: bypasses HIXL entirely, but measured 2026-11-05 to fail
+  # on this 910C node (aclrtReserveMemAddressNoUCMemory ret:107000, the driver
+  # rejects the 32 TiB UC reservation) -> engine startup dies. Opt-in only:
+  # export ASCEND_ENABLE_USE_FABRIC_MEM=1 when the driver supports it.
+  : "${ASCEND_ENABLE_USE_FABRIC_MEM:=0}"
+  export ASCEND_ENABLE_USE_FABRIC_MEM  # Bound HIXL connect/transfer retries (default 60 s blocks a request for a
   # minute when a peer segment is unreachable).
   export ASCEND_CONNECT_TIMEOUT="${ASCEND_CONNECT_TIMEOUT:-$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS}"
   export ASCEND_TRANSFER_TIMEOUT="${ASCEND_TRANSFER_TIMEOUT:-$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS}"
