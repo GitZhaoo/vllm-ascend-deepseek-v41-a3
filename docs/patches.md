@@ -1,8 +1,9 @@
 # 补丁与优化 gate
 
-本仓库只保留**当前 V4.1 / A3 / V2 路径实际执行**的 4 个补丁。每个补丁都以
-`vllm-ascend v0.30.0rc2`（`8fde6d4e3`，rc2-a3 镜像自带）为基线，并已用
-`git apply --check` 在干净的 rc2 源码树上验证可顺序应用。
+本仓库只保留**当前 V4.1 / A3 / V2 路径实际执行**的补丁：vllm-ascend 侧 5 个，
+vllm 侧 1 个。vllm-ascend 补丁以 `vllm-ascend v0.30.0rc2`
+（`8fde6d4e3`，rc2-a3 镜像自带）为基线，vllm 补丁以 `vllm ced6857af` 为基线，
+并已用 `git apply --check` 在干净源码树上验证可顺序应用。
 
 > `0002-dsa-v41.patch` 由生产 rootfs 的实际 diff 重新生成（去掉文件 mode 变化），
 > 保证「新部署得到的代码 = 已验证运行的代码」。早期手工编辑的补丁版本与
@@ -14,8 +15,13 @@ scripts/patches/vllm-ascend-v41-rc2/
 ├── 0002-dsa-v41.patch
 ├── 0004-model-opts.patch
 ├── 0005-packed-cache-slot-mapping-scalar.patch
+├── 0101-kvpool-mrv2-resume.patch
 ├── series.conf
 └── README.md
+
+scripts/patches/vllm-ced6857af/
+├── 0001-deepseek-v41-encoding-safety.patch
+└── series.conf
 ```
 
 ---
@@ -47,10 +53,11 @@ scripts/patches/vllm-ascend-v41-rc2/
 
 该文件含本地修改，是当前生产实际运行的版本。
 
-> `0002` 会在一次 metadata build 内缓存 `raw_slots` / `active_slots` / `valid`
-> 视图（依赖 runner 每次 build 重置 `common_v41_metadata`）。升级 runner 后若
-> 该字典改为跨 step 复用，必须移除这些缓存，否则可能把旧 step 的 slot 视图
-> 带进新 step，导致 KV 写入错误块。升级时请重点复核这一点。
+> 2026-11-05 起，`0002` 已移除跨 build 的 `raw_slots` / `active_slots` /
+> `valid` / `arange` 缓存：这些视图必须每次 build 从当前 `slot_mapping`
+> 重新推导。只保留最终 `[T,2]` / flat 映射缓存，且 key 含
+> `num_input_tokens`。这消除了旧版「旧 step 的 slot 视图被带进新 step，
+> 导致 KV 写入错误块」的隐患，也与 pristine 上游的语义一致。
 
 ### 0004 — 模型与算子微优化
 
@@ -75,6 +82,28 @@ scripts/patches/vllm-ascend-v41-rc2/
 
 这是 6N 图桶之外最重要的 decode 侧收益之一。
 
+### 0101 — KV 池 MRV2 抢占恢复（`pool_scheduler.py`）
+
+外部 KV 池接入 `AscendStoreConnector` 后，MRV2 通过 `scheduled_new_reqs`
+恢复被抢占的请求，并携带完整 block table。旧代码在
+`_process_new_request` 中没有清掉 `_preempted_req_ids` 标记，下一步 RUNNING
+会走 preempted 分支、替换完整 table 并重置 save 进度，最终把错误的 block
+关联到池 key（可能静默算错）。
+
+补丁只在 `use_v2_model_runner` 时 discard 该标记；MRV1 仍由
+`_process_preempted_cached_request` 消费。`DSV41_KV_POOL=0` 时该路径不会执行，
+但保留补丁无害。
+
+### vllm 侧 — DeepSeek-V4.1 tokenizer 输入安全
+
+`vllm/tokenizers/deepseek_v41_encoding.py`：
+
+1. **控制 token 逃逸**：用户/工具文本里写 `<｜System｜>`、`<｜Assistant｜>` 等
+   会编码成单个 token，可伪造轮次边界。补丁在渲染前把控制 token 拆开
+   （插入零宽空格），文本仍可读，但不再产生特殊 token。
+2. **空 developer 消息**：只挂 tools、没有正文的 developer 消息不再触发
+   `assert content`，避免 HTTP 500。
+
 ---
 
 ## 2. 已移除的补丁
@@ -82,10 +111,8 @@ scripts/patches/vllm-ascend-v41-rc2/
 | 补丁 | 移除原因 |
 |---|---|
 | `0003-dsa-v1-o-proj-2d.patch` | V4.1 使用 `AscendDSAV41Impl`，不执行 `dsa_v1.AscendDSAImpl._wo_a_bmm` |
-| `0101-kvpool-mrv2-resume.patch` | 当前 serve 命令未挂 `--kv-transfer-config`，没有执行路径 |
 
-如果将来启用外部 KV 池（`--kv-transfer-config`），需要重新评估 `0101`：
-缺它时抢占恢复可能把池 key 关联到错误 block，属于静默正确性问题。
+`0101` 已随外部 KV 池一起恢复；它不再是“可选/无执行路径”的补丁。
 
 ---
 
@@ -132,20 +159,42 @@ bash scripts/apply_patches.sh verify
 ## 4. 应用 / 回滚机制
 
 ```bash
-bash scripts/apply_patches.sh status    # 是否已应用 + gate 默认值
-bash scripts/apply_patches.sh check     # git apply --check（不改文件）
+bash scripts/apply_patches.sh status    # 每个组件/每个补丁 + gate 默认值
+bash scripts/apply_patches.sh check     # 状态检查（不改文件）
 bash scripts/apply_patches.sh apply     # 应用 + 固化默认值（幂等）
-bash scripts/apply_patches.sh verify    # 校验 6 个 gate
+bash scripts/apply_patches.sh verify    # 6 个 gate + 0101 + vllm encoding
 bash scripts/apply_patches.sh revert --force
 ```
 
 细节：
 
-- 目标目录默认 `$DSV41_ROOTFS/vllm-workspace/vllm-ascend`，可用 `SRC=` 覆盖；
+- 默认管理两个组件：
+  - vllm-ascend：`$DSV41_ROOTFS/vllm-workspace/vllm-ascend`；
+  - vllm：`$DSV41_ROOTFS/vllm-workspace/vllm`。
+- 单组件调试可用 `SRC=` / `PATCH_DIR=` 覆盖；
 - 若目标不是 git 工作树，自动退回 `patch -p1`；但 `revert` 仍需要 git；
-- 应用成功后写入 `.patches-applied`；
-- `apply` 检测到 `envs.py` 已含 gate 名称时跳过重复 `git apply`；
+- 每个 marker 写入补丁的 SHA-256。`status`/`apply` 会比对：
+  - 补丁内容变了而树里还是旧版本 → `[补丁已变更]`，必须
+    `revert --force` 后重新 `apply`（不再只凭 marker 判断“已应用”）；
+  - 另外写入 `series.fingerprint`（series.conf + 各补丁 + 目标 HEAD），
+    任一项变化都会在 `status` 里报“序列已变化”；
+- `apply` 检测到补丁已应用时跳过重复 `git apply`，并自动把旧版 marker
+  升级为带 SHA-256 的格式；
 - 回滚只 `git checkout` 补丁涉及的文件，不影响其它本地改动。
+
+### 定向回归
+
+```bash
+# 需要 torch_npu + 已打补丁的源码树
+PYTHONPATH=$DSV41_ROOTFS/vllm-workspace/vllm-ascend \
+  /cache/dsv41-rc2-rootfs/usr/local/python3.12*/bin/python3.12 \
+  -m pytest tests/ut -q
+# 或 make test-patches PYTHON=...
+```
+
+- `tests/ut/ops/triton/test_packed_cache_slot_mapping.py`：0005 的 33 个等价性用例；
+- `tests/ut/distributed/ascend_store/test_mrv2_preempt_marker.py`：0101 的 MRV2
+  抢占标记回归。
 
 ---
 

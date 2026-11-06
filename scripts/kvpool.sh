@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
 # =============================================================================
-# kvpool.sh — Mooncake KV pool lifecycle (AscendStoreConnector)
+# kvpool.sh — external KV pool (AscendStoreConnector + MemCache MetaService)
 #
-# The external KV pool lets vLLM keep prefix-cache blocks in host memory
-# (registered through Mooncake) instead of only in NPU HBM, so repeated
-# prefixes — long documents, multi-turn chat, shared system prompts — hit the
-# cache across requests and across DP ranks instead of being recomputed.
+# This follows the reference deployment
+# CJYLZS/vllm-ascend-deepseek-v41-a2 (kv_offload.sh):
 #
-# serve.sh calls `kvpool.sh ensure` before launching the engine when
-# DSV41_KV_POOL=1 (the default). `ensure` writes the Mooncake config and starts
-# mooncake_master unless something already listens on the master port.
+#   * backend = memcache_hybrid (not Mooncake);
+#   * transport = host_shm (host_rdma's extend library is a 0-byte stub in
+#     this image; device_rdma segfaults at 8+ ranks);
+#   * a CPU-only MetaService (no card, no HBM) is started on 5100/6100/8100;
+#   * each rank registers DSV41_KV_DRAM_GB of host DRAM (16 dies × 2 GB by
+#     default);
+#   * the engine is started with
+#       --kv-transfer-config '{"kv_connector":"AscendStoreConnector",
+#         "kv_role":"kv_both","kv_connector_extra_config":{"backend":"memcache"}}'
+#     and MMC_LOCAL_CONFIG_PATH pointing at mmc-local.conf.
 #
-# Commands:
-#   ensure         write config + start master if needed (used by serve.sh)
-#   start          start mooncake_master (idempotent; reuses an external one)
-#   stop           stop the harness-started master only
-#   status         show pid / port / configured segment size
-#   render-config  write mooncake.json and print its path
-#   print-env      print the effective settings (debugging)
+# The pool is OFF by default. The 0101 patch (MRV2 preemption marker) is a
+# correctness gate: without it a preempted request can associate the wrong
+# block table with pool keys (silent wrong output).
 #
-# Rollback: DSV41_KV_POOL=0 disables the pool entirely (serve.sh then starts
-# the engine exactly as before). Config lives in config/dsv41.local.env.
+# Usage:
+#   bash scripts/kvpool.sh check-capacity   # read-only memory budget check
+#   bash scripts/kvpool.sh render-config    # write conf files, print local conf
+#   bash scripts/kvpool.sh start            # start/reuse MetaService
+#   bash scripts/kvpool.sh stop             # stop the MetaService we started
+#   bash scripts/kvpool.sh status           # state + capacity
+#   bash scripts/kvpool.sh ensure           # capacity + config + start (serve.sh)
+#   bash scripts/kvpool.sh print-env        # effective variables
 # =============================================================================
 set -Eeuo pipefail
 
@@ -28,270 +35,272 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 . "$SELF_DIR/common.sh"
 
+RFS=${DSV41_ROOTFS%/}
+PY=${DSV41_KV_PYTHON:-}
+if [ -z "$PY" ]; then
+  PY_HOME=$(find "$RFS/usr/local" -maxdepth 1 -type d -name 'python3.12*' 2>/dev/null | sort -V | tail -1 || true)
+  PY="${PY_HOME:-}/bin/python3.12"
+fi
+CANN=${DSV41_CANN_HOME:-$(find "$RFS/usr/local/Ascend" -maxdepth 1 -type d -name 'cann-*' 2>/dev/null | sort -V | tail -1 || true)}
+if [ -n "${CANN:-}" ] && [ -d "$CANN" ]; then
+  export LD_LIBRARY_PATH="$CANN/lib64:$CANN/runtime/lib64:${LD_LIBRARY_PATH:-}"
+fi
+
+RANKS=$((DSV41_DP * DSV41_TP))
+LOCAL_CONF="$DSV41_KVPOOL_STATE_DIR/mmc-local.conf"
+META_CONF="$DSV41_KVPOOL_STATE_DIR/mmc-meta.conf"
+META_LOG="$DSV41_KV_META_LOG"
+META_PID_FILE="$DSV41_KV_META_PID_FILE"
+METRICS_URL="http://127.0.0.1:${DSV41_KV_METRICS_PORT}/metrics"
+
 die() { echo "[kvpool] ❌ $*" >&2; exit 1; }
 log() { echo "[kvpool] $*" >&2; }
+warn() { echo "[kvpool] ⚠ $*" >&2; }
 
-MASTER_HOST=${DSV41_MOONCAKE_MASTER%:*}
-MASTER_PORT=${DSV41_MOONCAKE_MASTER##*:}
-MOONCAKE_CFG="$DSV41_KVPOOL_STATE_DIR/mooncake.json"
-RFS=${DSV41_ROOTFS%/}
-
-# /dev/tcp probe keeps this dependency-free on hosts without ss/netcat.
-# A 2 s timeout avoids hanging on an unreachable remote master address.
-port_open() {
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 2 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+port_listening() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -qE ":${port}([^0-9]|$)"
   else
-    (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null
+    netstat -tln 2>/dev/null | grep -qE ":${port}([^0-9]|$)"
   fi
 }
 
-rootfs_python() {
-  local home=${DSV41_PYTHONHOME:-$(find "$RFS/usr/local" -maxdepth 1 -type d -name 'python3.12*' 2>/dev/null | sort -V | tail -1)}
-  if [ -z "$home" ] || [ ! -x "$home/bin/python3.12" ]; then
-    die "找不到 rootfs Python（先 bash scripts/setup_rootfs.sh，或设置 DSV41_PYTHONHOME）"
-  fi
-  echo "$home/bin/python3.12"
+metrics_ok() {
+  curl -sf --noproxy '*' --max-time 2 "$METRICS_URL" 2>/dev/null \
+    | grep -q '^memcache_'
 }
 
-# ---- capacity preflight ----------------------------------------------------
-# The pool pins host RAM: segment_size × (TP × DP) stays locked while the engine
-# runs. Asking for more than the node can keep free makes the connector fail
-# inside the workers (HcommMemReg ret:19 → "Initialize mooncake failed", ret=-600)
-# only after the model has loaded, so the budget is checked before launch.
-meminfo_kib() {
-  awk -v key="$1" '$1 == key ":" { printf "%d", $2; found = 1 } END { exit(found ? 0 : 1) }' "$DSV41_MEMINFO_FILE"
+meta_pid() {
+  [ -f "$META_PID_FILE" ] || return 1
+  local pid
+  pid=$(cat "$META_PID_FILE" 2>/dev/null || true)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && echo "$pid"
 }
 
-segment_gib() {
-  awk -v v="$DSV41_MOONCAKE_SEGMENT_SIZE" 'BEGIN {
-    if (v ~ /^[0-9]+$/) { printf "%d", v / 1073741824; exit }
-    if (v ~ /^[0-9]+[Gg]([Ii])?[Bb]$/) { sub(/[Gg]([Ii])?[Bb]$/, "", v); printf "%d", v; exit }
-    if (v ~ /^[0-9]+[Mm]([Ii])?[Bb]$/) { sub(/[Mm]([Ii])?[Bb]$/, "", v); printf "%d", v / 1024; exit }
-    printf "0"
-  }'
+meta_running() {
+  meta_pid >/dev/null 2>&1
 }
 
-cmd_check_capacity() {
-  local seg ranks required avail total reserve cap limit suggest
-  seg=$(segment_gib)
-  [ "$seg" -gt 0 ] 2>/dev/null || die "无效的 DSV41_MOONCAKE_SEGMENT_SIZE=$DSV41_MOONCAKE_SEGMENT_SIZE（示例: 32GB）"
-  ranks=$((DSV41_TP * DSV41_DP))
-  [ "$ranks" -gt 0 ] || die "DSV41_TP × DSV41_DP 必须大于 0（当前 $DSV41_TP × $DSV41_DP）"
-  required=$((seg * ranks))
+check_capacity() {
+  local dram="$DSV41_KV_DRAM_GB" total avail limit suggest
+  printf '%s' "$dram" | grep -Eq '^[0-9]+(\.[0-9]+)?$' \
+    || die "无效的 DSV41_KV_DRAM_GB=$dram（每 rank 的 GB 数，例如 2）"
+  awk -v v="$dram" 'BEGIN {exit !(v > 0)}' \
+    || die "DSV41_KV_DRAM_GB=$dram 必须大于 0"
 
-  local avail_kib total_kib
-  avail_kib=$(meminfo_kib MemAvailable) || die "读不到 MemAvailable（DSV41_MEMINFO_FILE=$DSV41_MEMINFO_FILE）"
-  total_kib=$(meminfo_kib MemTotal) || die "读不到 MemTotal（DSV41_MEMINFO_FILE=$DSV41_MEMINFO_FILE）"
-  avail=$((avail_kib / 1048576))
-  total=$((total_kib / 1048576))
-  reserve=$DSV41_KVPOOL_MIN_FREE_GIB
-  cap=$((total * DSV41_KVPOOL_MAX_MEM_PCT / 100))
-
-  limit=$cap
-  if [ $((avail - reserve)) -lt "$limit" ]; then
-    limit=$((avail - reserve))
-  fi
-  if [ "$required" -le "$limit" ]; then
-    log "容量校验通过：${seg}GB/卡 × ${ranks} = ${required} GiB（MemTotal ${total} GiB，可用 ${avail} GiB，上限 ${cap} GiB，保留 ${reserve} GiB）"
+  total=$(awk -v d="$dram" -v r="$RANKS" 'BEGIN {printf "%.1f", d*r}')
+  read -r avail_mib total_mib < <(awk '
+    /^MemTotal:/ {t=$2}
+    /^MemAvailable:/ {a=$2}
+    END {printf "%.0f %.0f\n", a/1024, t/1024}
+  ' "$DSV41_MEMINFO_FILE" 2>/dev/null || true)
+  [ -n "${total_mib:-}" ] && [ "$total_mib" -gt 0 ] \
+    || die "无法读取 $DSV41_MEMINFO_FILE 的 MemTotal/MemAvailable"
+  avail=$(awk -v m="$avail_mib" 'BEGIN {printf "%.1f", m/1024}')
+  limit=$(awk -v t="$total_mib" -v p="$DSV41_KVPOOL_MAX_MEM_PCT" 'BEGIN {printf "%.1f", t/1024*p/100}')
+  # Pool must fit both the percentage budget and "keep MIN_FREE_GIB free".
+  if awk -v total="$total" -v limit="$limit" -v avail="$avail" \
+        -v reserve="$DSV41_KVPOOL_MIN_FREE_GIB" \
+        'BEGIN {exit !(total <= limit && total <= avail - reserve)}'; then
+    log "容量校验通过：${dram}GB/rank × ${RANKS} = ${total} GiB（MemTotal $(awk -v m="$total_mib" 'BEGIN{printf "%.0f",m/1024}') GiB，可用 ${avail} GiB，上限 ${limit} GiB，保留 ${DSV41_KVPOOL_MIN_FREE_GIB} GiB）"
     return 0
   fi
-
-  suggest=$((limit / ranks / 4 * 4))
-  [ "$suggest" -ge 4 ] || suggest=4
-  {
-    log "❌ KV 池容量不足：需要 ${required} GiB（${seg}GB/卡 × ${ranks} 卡）"
-    log "   MemTotal ${total} GiB，MemAvailable ${avail} GiB，允许上限 ${limit} GiB（池 ≤ ${DSV41_KVPOOL_MAX_MEM_PCT}% 内存且保留 ${reserve} GiB）"
-    log "   引擎启动后还会占用数百 GiB 宿主内存，注册阶段才失败会白等一轮模型加载。"
-    log "   修复：把 DSV41_MOONCAKE_SEGMENT_SIZE 降到 ${suggest}GB（或 DSV41_KV_POOL=0 关闭外部池）后重启。"
-  } >&2
+  suggest=$(awk -v limit="$limit" -v avail="$avail" -v reserve="$DSV41_KVPOOL_MIN_FREE_GIB" -v r="$RANKS" \
+    'BEGIN {m=limit; if (avail-reserve < m) m=avail-reserve; v=int(m/r/2)*2; if (v<1) v=1; printf "%d", v}')
+  log "容量校验失败：${dram}GB/rank × ${RANKS} = ${total} GiB"
+  log "   MemTotal $(awk -v m="$total_mib" 'BEGIN{printf "%.0f",m/1024}') GiB，可用 ${avail} GiB，上限 ${limit} GiB（池 ≤ ${DSV41_KVPOOL_MAX_MEM_PCT}% 且保留 ${DSV41_KVPOOL_MIN_FREE_GIB} GiB）"
+  log "   修复：把 DSV41_KV_DRAM_GB 降到 ${suggest}GB（或 DSV41_KV_POOL=0 关闭外部池）后重启。"
   return 1
 }
 
 render_config() {
-  mkdir -p "$DSV41_KVPOOL_STATE_DIR"
-  local ssd_flag=false ssd_path="" pref_flag=false
-  if [ "$DSV41_MOONCAKE_PREFERRED_SEGMENT" = "1" ]; then
-    pref_flag=true
-  fi
-  if [ "$DSV41_MOONCAKE_SSD_OFFLOAD" = "1" ]; then
-    [ -n "$DSV41_MOONCAKE_SSD_PATH" ] || die "DSV41_MOONCAKE_SSD_OFFLOAD=1 需要 DSV41_MOONCAKE_SSD_PATH"
-    ssd_flag=true
-    ssd_path=$DSV41_MOONCAKE_SSD_PATH
-  fi
-  cat > "$MOONCAKE_CFG" <<JSON
-{
-  "metadata_server": "P2PHANDSHAKE",
-  "protocol": "ascend",
-  "device_name": "",
-  "master_server_address": "$DSV41_MOONCAKE_MASTER",
-  "global_segment_size": "$DSV41_MOONCAKE_SEGMENT_SIZE",
-  "local_buffer_size": "$DSV41_MOONCAKE_LOCAL_BUFFER",
-  "preferred_segment": $pref_flag,
-  "prefer_alloc_in_same_node": true,
-  "enable_ssd_offload": $ssd_flag,
-  "ssd_offload_path": "$ssd_path",
-  "tenant_id": "$DSV41_MOONCAKE_TENANT"
-}
-JSON
-  echo "$MOONCAKE_CFG"
-}
-
-master_pid() {
-  local pid=""
-  [ -f "$DSV41_MOONCAKE_PID_FILE" ] && pid=$(cat "$DSV41_MOONCAKE_PID_FILE" 2>/dev/null || true)
-  # Guard against PID reuse after a reboot: only trust the pidfile when the
-  # process really is mooncake_master.
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
-    && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "mooncake_master"; then
-    echo "$pid"
-    return 0
-  fi
-  return 1
-}
-
-cmd_start() {
-  local pid
-  if pid=$(master_pid); then
-    log "mooncake_master 已在运行 (pid=$pid, $DSV41_MOONCAKE_MASTER)"
-    return 0
-  fi
-  if port_open "$MASTER_HOST" "$MASTER_PORT"; then
-    log "端口 $DSV41_MOONCAKE_MASTER 已有 master 监听（复用外部 master）"
-    return 0
-  fi
-
-  local py bin home launcher
-  py=$(rootfs_python)
-  home=${py%/bin/python3.12}
-  bin=${DSV41_MOONCAKE_MASTER_BIN:-$home/bin/mooncake_master}
-  [ -x "$bin" ] || die "找不到 mooncake_master: $bin（设置 DSV41_MOONCAKE_MASTER_BIN）"
-  # setsid puts the entry script and the real binary it spawns in one process
-  # group, so stop can terminate the whole tree.
-  launcher=setsid
-  command -v setsid >/dev/null 2>&1 || launcher=nohup
-
-  render_config >/dev/null
-  mkdir -p "$(dirname "$DSV41_MOONCAKE_LOG")"
-  log "启动 mooncake_master → $DSV41_MOONCAKE_MASTER (metrics :$DSV41_MOONCAKE_METRICS_PORT，日志 $DSV41_MOONCAKE_LOG)"
-  HOME="${HOME:-/root}" PYTHONHOME="$home" \
-    PYTHONPATH="$RFS/vllm-workspace/vllm-ascend:$RFS/vllm-workspace/vllm" \
-    "$launcher" "$bin" "--rpc_port=$MASTER_PORT" "--metrics_port=$DSV41_MOONCAKE_METRICS_PORT" \
-      >"$DSV41_MOONCAKE_LOG" 2>&1 &
-  pid=$!
-  echo "$pid" > "$DSV41_MOONCAKE_PID_FILE"
-
-  local i
-  for i in $(seq 1 30); do
-    port_open "$MASTER_HOST" "$MASTER_PORT" && break
-    kill -0 "$pid" 2>/dev/null || { tail -n 20 "$DSV41_MOONCAKE_LOG" >&2 || true; die "mooncake_master 启动失败"; }
-    sleep 1
+  local dram="$DSV41_KV_DRAM_GB"
+  printf '%s' "$dram" | grep -Eq '^[0-9]+(\.[0-9]+)?$' \
+    || die "无效的 DSV41_KV_DRAM_GB=$dram"
+  case "$DSV41_KV_PROTOCOL" in
+    host_shm) ;;
+    host_rdma)
+      warn "host_rdma 在本镜像不可用：libmf_hybm_accoffload.so 是 0 字节，ExtendLibrary 加载失败"
+      ;;
+    device_rdma)
+      warn "device_rdma 单 rank 能过、8+ rank 必 segfault；默认应使用 host_shm"
+      ;;
+    *) die "未知 DSV41_KV_PROTOCOL=$DSV41_KV_PROTOCOL（host_shm|host_rdma|device_rdma）" ;;
+  esac
+  case "$DSV41_KV_META_PORT$DSV41_KV_STORE_PORT$DSV41_KV_METRICS_PORT" in
+    *[!0-9]*) die "KV 端口必须是数字（meta/store/metrics）" ;;
+  esac
+  for p in "$DSV41_KV_META_PORT" "$DSV41_KV_STORE_PORT" "$DSV41_KV_METRICS_PORT"; do
+    [ "$p" != "$DSV41_PORT" ] || die "KV 端口 $p 与 vLLM --port 相同"
   done
-  port_open "$MASTER_HOST" "$MASTER_PORT" || { tail -n 20 "$DSV41_MOONCAKE_LOG" >&2 || true; die "mooncake_master 30s 内未监听 $DSV41_MOONCAKE_MASTER"; }
-  log "mooncake_master 就绪 (pid=$pid)"
+
+  mkdir -p "$DSV41_KVPOOL_STATE_DIR"
+  cat > "$LOCAL_CONF" <<EOF
+ock.mmc.meta_service_url = tcp://127.0.0.1:${DSV41_KV_META_PORT}
+ock.mmc.local_service.config_store_url = tcp://127.0.0.1:${DSV41_KV_STORE_PORT}
+ock.mmc.log_level = info
+ock.mmc.local_service.world_size = ${DSV41_KV_WORLD_SIZE}
+ock.mmc.local_service.protocol = ${DSV41_KV_PROTOCOL}
+ock.mmc.local_service.dram.size = ${dram}GB
+EOF
+  cat > "$META_CONF" <<EOF
+ock.mmc.meta_service_url = tcp://127.0.0.1:${DSV41_KV_META_PORT}
+ock.mmc.meta_service.config_store_url = tcp://127.0.0.1:${DSV41_KV_STORE_PORT}
+ock.mmc.meta_service.metrics_url = http://127.0.0.1:${DSV41_KV_METRICS_PORT}
+ock.mmc.log_level = info
+EOF
+  echo "$LOCAL_CONF"
 }
 
-cmd_stop() {
-  local pid pgid own_pgid
-  if ! pid=$(master_pid); then
-    log "没有 harness 启动的 mooncake_master 在运行"
-    rm -f "$DSV41_MOONCAKE_PID_FILE"
+require_tree_fix() {
+  [ "$DSV41_KV_POOL" = "1" ] || return 0
+  local f="$RFS/vllm-workspace/vllm-ascend/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py"
+  if [ ! -f "$f" ]; then
+    if [ "$DSV41_KV_ALLOW_UNFIXED_TREE" = "1" ]; then
+      warn "找不到 $f；KV_ALLOW_UNFIXED_TREE=1 放行"
+      return 0
+    fi
+    {
+      echo "[kvpool] ❌ KV_OFFLOAD 已开启，但找不到 pool_scheduler.py：$f"
+      echo "        无法确认 0101（MRV2 抢占恢复）是否正确应用。"
+      echo "        处理：bash scripts/apply_patches.sh apply；或设 DSV41_KV_ALLOW_UNFIXED_TREE=1 明确带病跑。"
+    } >&2
+    exit 8
+  fi
+  if grep -q '_preempted_req_ids.discard(request.req_id)' "$f"; then
     return 0
   fi
-  # The mooncake_master entry script spawns the real binary as a child; it is
-  # started with setsid so the whole tree shares one process group.
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-  own_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)
-  log "停止 mooncake_master (pid=$pid${pgid:+, pgid=$pgid})"
-  if [ -n "$pgid" ] && [ "$pgid" != "$own_pgid" ]; then
-    kill -TERM -- "-$pgid" 2>/dev/null || true
-  else
-    kill -TERM "$pid" 2>/dev/null || true
+  if [ "$DSV41_KV_ALLOW_UNFIXED_TREE" = "1" ]; then
+    warn "源码树缺 0101（MRV2 抢占恢复）；KV_ALLOW_UNFIXED_TREE=1 放行，可能静默算错"
+    return 0
   fi
+  {
+    echo "[kvpool] ❌ KV_OFFLOAD 已开启，但源码树不含 0101（MRV2 抢占恢复）"
+    echo "        后果：抢占后池 key 可能关联到错误的 block，命中池读到别人的 KV，日志不报错。"
+    echo "        处理：bash scripts/apply_patches.sh apply（或设 DSV41_KV_ALLOW_UNFIXED_TREE=1 明确带病跑）"
+  } >&2
+  exit 8
+}
+
+start_meta() {
+  [ "$DSV41_KV_POOL" = "1" ] || die "DSV41_KV_POOL=0（未启用外部池）"
+  require_tree_fix
+  [ -x "$PY" ] || die "找不到 rootfs Python: $PY"
+  render_config >/dev/null
+  mkdir -p "$(dirname "$META_LOG")" "$(dirname "$META_PID_FILE")"
+
+  if meta_running; then
+    if metrics_ok; then
+      log "MetaService 已在运行 (pid=$(meta_pid), :$DSV41_KV_METRICS_PORT)，复用（池内容保留）"
+      return 0
+    fi
+    warn "MetaService pid=$(meta_pid) 存在但 metrics 不通，重启"
+    stop_meta >/dev/null 2>&1 || true
+  elif metrics_ok; then
+    log "检测到外部 MetaService（:$DSV41_KV_METRICS_PORT），复用"
+    return 0
+  fi
+
+  local p miss=""
+  for p in "$DSV41_KV_META_PORT" "$DSV41_KV_STORE_PORT" "$DSV41_KV_METRICS_PORT"; do
+    port_listening "$p" && miss="$miss $p"
+  done
+  if [ -n "$miss" ]; then
+    die "启动 MetaService 前端口已被占用:$miss（查 ss -ltnp；或复用/停止旧实例）"
+  fi
+
+  log "启动 MetaService → :$DSV41_KV_META_PORT/:$DSV41_KV_STORE_PORT/:$DSV41_KV_METRICS_PORT，日志 $META_LOG"
+  MMC_META_CONFIG_PATH="$META_CONF" \
+    nohup "$PY" -c 'from memcache_hybrid import MetaService; MetaService.main()' \
+      >"$META_LOG" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$META_PID_FILE"
   local i
-  for i in $(seq 1 15); do
+  for i in $(seq 1 60); do
+    if metrics_ok; then
+      log "✅ MetaService 就绪 (pid=$pid)"
+      return 0
+    fi
     kill -0 "$pid" 2>/dev/null || break
     sleep 1
   done
-  if kill -0 "$pid" 2>/dev/null; then
-    if [ -n "$pgid" ] && [ "$pgid" != "$own_pgid" ]; then
-      kill -KILL -- "-$pgid" 2>/dev/null || true
-    else
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-  fi
-  rm -f "$DSV41_MOONCAKE_PID_FILE"
-  if port_open "$MASTER_HOST" "$MASTER_PORT"; then
-    log "⚠️ $DSV41_MOONCAKE_MASTER 仍有监听（可能是外部 master，未被停止）"
-  else
-    log "mooncake_master 已停止"
-  fi
+  echo "[kvpool] ❌ MetaService 60s 内未就绪" >&2
+  tail -n 30 "$META_LOG" >&2 || true
+  kill "$pid" 2>/dev/null || true
+  rm -f "$META_PID_FILE"
+  exit 6
 }
 
-cmd_status() {
+stop_meta() {
   local pid
-  if pid=$(master_pid); then
-    echo "[kvpool] master 运行中 pid=$pid addr=$DSV41_MOONCAKE_MASTER metrics=:$DSV41_MOONCAKE_METRICS_PORT"
-  elif port_open "$MASTER_HOST" "$MASTER_PORT"; then
-    echo "[kvpool] 端口 $DSV41_MOONCAKE_MASTER 有外部 master 监听（非本脚本启动）"
-  else
-    echo "[kvpool] master 未运行"
-    return 1
+  pid=$(meta_pid || true)
+  if [ -n "$pid" ]; then
+    log "停止 MetaService pid=$pid"
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in $(seq 1 20); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "$pid" 2>/dev/null || true
   fi
-  echo "[kvpool] kv_pool=$DSV41_KV_POOL backend=$DSV41_MOONCAKE_BACKEND segment=${DSV41_MOONCAKE_SEGMENT_SIZE}/card tenant=$DSV41_MOONCAKE_TENANT"
-  echo "[kvpool] config=$MOONCAKE_CFG"
+  rm -f "$META_PID_FILE"
+  if metrics_ok; then
+    warn ":$DSV41_KV_METRICS_PORT/metrics 仍有响应（可能是外部 MetaService，未停止）"
+  fi
 }
 
-cmd_ensure() {
-  [ "$DSV41_KV_POOL" = "1" ] || die "DSV41_KV_POOL=0（ensure 只在启用时调用）"
-  cmd_check_capacity || die "容量预检未通过，未启动引擎（改 DSV41_MOONCAKE_SEGMENT_SIZE 或 DSV41_KV_POOL=0）"
-  render_config >/dev/null
-  cmd_start
-  log "✅ kv pool 就绪 config=$MOONCAKE_CFG master=$DSV41_MOONCAKE_MASTER segment=${DSV41_MOONCAKE_SEGMENT_SIZE}/card"
-  # stdout is consumed by serve.sh: path to mooncake.json.
-  echo "$MOONCAKE_CFG"
+show_status() {
+  echo "[kvpool] kv_pool=$DSV41_KV_POOL backend=$DSV41_KV_BACKEND protocol=$DSV41_KV_PROTOCOL dram=${DSV41_KV_DRAM_GB}GB/rank ranks=$RANKS"
+  echo "[kvpool] meta=:$DSV41_KV_META_PORT store=:$DSV41_KV_STORE_PORT metrics=:$DSV41_KV_METRICS_PORT conf=$LOCAL_CONF"
+  if pid=$(meta_pid 2>/dev/null); then
+    echo "[kvpool] MetaService 运行中 pid=$pid"
+  elif metrics_ok; then
+    echo "[kvpool] MetaService 由外部启动（metrics 可达）"
+  else
+    echo "[kvpool] MetaService 未运行"
+  fi
+  if metrics_ok; then
+    curl -s --noproxy '*' --max-time 3 "$METRICS_URL" \
+      | awk '/^memcache_total_capacity_bytes/ {printf "[kvpool] %s %s\n", $1, $2}'
+  fi
 }
 
-cmd_print_env() {
-  cat <<ENV
+print_env() {
+  cat <<EOF
 DSV41_KV_POOL=$DSV41_KV_POOL
-DSV41_MOONCAKE_MASTER=$DSV41_MOONCAKE_MASTER
-DSV41_MOONCAKE_METRICS_PORT=$DSV41_MOONCAKE_METRICS_PORT
-DSV41_MOONCAKE_SEGMENT_SIZE=$DSV41_MOONCAKE_SEGMENT_SIZE
-DSV41_MOONCAKE_LOCAL_BUFFER=$DSV41_MOONCAKE_LOCAL_BUFFER
-DSV41_MOONCAKE_BACKEND=$DSV41_MOONCAKE_BACKEND
-DSV41_MOONCAKE_TENANT=$DSV41_MOONCAKE_TENANT
-DSV41_MOONCAKE_SSD_OFFLOAD=$DSV41_MOONCAKE_SSD_OFFLOAD
-DSV41_MOONCAKE_SSD_PATH=$DSV41_MOONCAKE_SSD_PATH
-DSV41_MOONCAKE_PREFERRED_SEGMENT=$DSV41_MOONCAKE_PREFERRED_SEGMENT
-DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS=$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS
+DSV41_KV_DRAM_GB=$DSV41_KV_DRAM_GB
+DSV41_KV_PROTOCOL=$DSV41_KV_PROTOCOL
+DSV41_KV_WORLD_SIZE=$DSV41_KV_WORLD_SIZE
+DSV41_KV_META_PORT=$DSV41_KV_META_PORT
+DSV41_KV_STORE_PORT=$DSV41_KV_STORE_PORT
+DSV41_KV_METRICS_PORT=$DSV41_KV_METRICS_PORT
+DSV41_KV_BACKEND=$DSV41_KV_BACKEND
+DSV41_KV_META_LOG=$DSV41_KV_META_LOG
+DSV41_KV_META_PID_FILE=$DSV41_KV_META_PID_FILE
+DSV41_KV_ALLOW_UNFIXED_TREE=$DSV41_KV_ALLOW_UNFIXED_TREE
+DSV41_KVPOOL_STATE_DIR=$DSV41_KVPOOL_STATE_DIR
 DSV41_KVPOOL_MIN_FREE_GIB=$DSV41_KVPOOL_MIN_FREE_GIB
 DSV41_KVPOOL_MAX_MEM_PCT=$DSV41_KVPOOL_MAX_MEM_PCT
-DSV41_KVPOOL_STATE_DIR=$DSV41_KVPOOL_STATE_DIR
-DSV41_MOONCAKE_CONFIG=$MOONCAKE_CFG
-ENV
+EOF
 }
 
-case "${1:-}" in
-  start)          cmd_start ;;
-  stop)           cmd_stop ;;
-  status)         cmd_status ;;
-  check-capacity) cmd_check_capacity ;;
-  ensure)         cmd_ensure ;;
+case "${1:-status}" in
+  check-capacity) check_capacity ;;
   render-config)  render_config ;;
-  print-env)      cmd_print_env ;;
-  *)
-    cat >&2 <<USAGE
-用法: bash scripts/kvpool.sh <command>
-
-  start         启动 mooncake_master（幂等；已有 master 则复用）
-  stop          停止本脚本启动的 mooncake_master
-  status        查看 master / 配置状态
-  check-capacity 校验宿主内存预算（不启动任何进程）
-  ensure        校验预算 + 写配置 + 按需启动 master（serve.sh 调用）
-  render-config 生成 mooncake.json 并打印路径
-  print-env     打印生效配置
-USAGE
-    exit 2
+  start)          start_meta ;;
+  stop)           stop_meta ;;
+  status)         show_status ;;
+  print-env)      print_env ;;
+  ensure)
+    [ "$DSV41_KV_POOL" = "1" ] || die "DSV41_KV_POOL=0（未启用外部池）"
+    check_capacity
+    require_tree_fix
+    render_config >/dev/null
+    start_meta
+    log "✅ kv pool 就绪 config=$LOCAL_CONF"
+    echo "$LOCAL_CONF"
     ;;
+  *) echo "用法: $0 {check-capacity|render-config|start|stop|status|ensure|print-env}"; exit 1 ;;
 esac

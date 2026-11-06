@@ -1,231 +1,245 @@
-# 外部 KV 池（Mooncake / AscendStoreConnector）
+# 外部 KV 池（AscendStoreConnector + MemCache）
 
-本文档描述本项目的外部 KV 池：把 prefix cache 的 KV block 从 NPU HBM 扩展到
-**宿主内存**（Mooncake Store），让重复前缀（长文档、多轮对话、共享 system
-prompt）在跨请求、跨 DP rank 之间命中，而不是重复 prefill。
+本文档描述本项目的外部 KV 池。实现对齐参考部署
+`CJYLZS/vllm-ascend-deepseek-v41-a2` 的 `kv_offload.sh`：
 
-> ⚠️ **本机当前状态（2026-11-05，A3 910C）：不可用，已通过
-> `config/dsv41.local.env` 设为 `DSV41_KV_POOL=0`。**
-> 跨卡 HIXL 传输在本机稳定失败（`halDeviceDisableP2P ret:17`），一旦命中
-> 别的 rank 写入的 block 就会让 worker 退出，且崩溃后 HIXL 连初始化都失败。
-> 代码默认仍是 `DSV41_KV_POOL=1`（便于驱动/环境修好后一键恢复），本机由
-> local.env 关闭。复现证据、规避方式与恢复步骤见第 3.1 节。
+- 连接器：`AscendStoreConnector`，`backend=memcache`；
+- 池服务：`memcache_hybrid` 的 **MetaService**（纯 CPU 进程，不占 HBM/卡）；
+- 传输：`host_shm`（宿主机共享内存）；
+- 每个 rank 注册 `DSV41_KV_DRAM_GB` 宿主内存；
+- 启用前强制检查 **0101**（MRV2 抢占恢复）正确性补丁。
 
-参考实现：ModelScope `x0ken0/vllm-ascend-a2-dsv41f`（A2 / 910B3 / Docker）。
-本项目在其基础上按 A3（8×910C、DP2×TP8、native rootfs）适配。
+> 本机 `config/dsv41.local.env` 默认 `DSV41_KV_POOL=0`。这是有意的
+> opt-in 设计：先确认池能正常注册、业务确有长前缀复用收益，再打开。
 
-## 1. 作用与收益
+## 1. 为什么是 MemCache/host_shm
 
-| 维度 | 无外部 KV 池 | 有外部 KV 池（默认 32GB/卡） |
-|---|---|---|
-| KV 存放 | 仅 NPU HBM：1,268,538 tokens/rank（≈6.7 GiB） | HBM + 宿主内存：32 GiB/卡 × 16 卡 = **512 GiB** |
-| 等效容量 | 1.27M tokens/rank | ≈ **5.8M tokens/卡（≈4.6×）** |
-| 复用范围 | 单 rank 生命周期内 | 跨请求、跨 DP rank；同一 master 下可跨实例 |
-| 长文档二次提问 | 重新 prefill（慢，且 DP lockstep 阻塞另一 rank） | 直接命中，几乎免 prefill |
-| 重启后 | 空 | 空（除非启用 SSD offload） |
+参考部署在 A2/910B3 上已经验证过这条路径。两个硬约束必须保留：
 
-实测参考：KV 单价约 **5.5 KB/token**（6.7 GiB / 1,268,538）。
-容量换算：`tokens ≈ 32 GiB / 5.5 KB ≈ 5.8M`（64GB/卡 时为 ≈11.6M，但在这台
-2 TiB 节点上会因注册失败而无法启动，见第 3 节）。
+1. **`KV_PROTOCOL=host_shm`**。`host_rdma` 依赖的
+   `libmf_hybm_accoffload.so` 在本镜像里是 0 字节，加载即失败；
+   `device_rdma` 单 rank 能过，但 8 rank 会 segfault。
+2. **不要用 HIXL 做池内传输**。MetaService + host_shm 不经过跨卡 HIXL，
+   因此绕开了本机 A3 910C 的 `halDeviceDisableP2P ret:17` 问题。
+   容器运行时也不要额外注入 `-e LD_LIBRARY_PATH`，那会覆盖镜像里的
+   CANN 路径。
 
-## 2. 架构与默认值
+## 2. 架构
 
 ```
 client → prefix_router:8021 ──┬─→ rank0 API :8022 ─ DP0/TP8 ─┐
                              └─→ rank1 API :8023 ─ DP1/TP8 ─┤
-                                                             ├─ Mooncake segment（宿主内存，pin）
-                       mooncake_master :50088 ←──────────────┘
+                                                             ├─ host_shm 注册的 DRAM
+                  MetaService :5100/:6100/:8100 ←────────────┘  (2 GB/rank)
+                  (memcache_hybrid，CPU-only)
 ```
+
+`serve.sh` 在启动 vLLM 前调用：
+
+```bash
+bash scripts/kvpool.sh ensure
+```
+
+它做三件事：
+
+1. 校验内存预算与 0101；
+2. 写 `state/kvpool/mmc-local.conf` 和 `mmc-meta.conf`；
+3. 启动或复用 MetaService。
+
+然后引擎获得：
+
+```bash
+MMC_LOCAL_CONFIG_PATH=state/kvpool/mmc-local.conf
+--kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both",
+  "kv_connector_extra_config":{"backend":"memcache"}}'
+```
+
+## 3. 默认值与配置
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DSV41_KV_POOL` | `1` | 0 = 完全回滚到旧行为 |
-| `DSV41_MOONCAKE_SEGMENT_SIZE` | `32GB` | **每卡/die** 注册的宿主内存；须为 1GiB 整数倍 |
-| `DSV41_KVPOOL_MIN_FREE_GIB` | `256` | 预检要求启动后至少保留的宿主内存 |
-| `DSV41_KVPOOL_MAX_MEM_PCT` | `40` | 池总量不得超过 MemTotal 的该百分比 |
-| `DSV41_MOONCAKE_PREFERRED_SEGMENT` | `1` | 每个 rank 写入**自己的** segment（A3 必需，见 3.1） |
-| `DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS` | `10000` | HIXL 连接/传输超时（替代默认 60 s） |
-| `DSV41_MOONCAKE_MASTER` | `127.0.0.1:50088` | master RPC |
-| `DSV41_MOONCAKE_METRICS_PORT` | `9003` | master metrics |
-| `DSV41_MOONCAKE_BACKEND` | `mooncake` | 后端（mooncake / memcache / yuanrong） |
-| `DSV41_MOONCAKE_TENANT` | `default` | 多租户隔离 |
-| `DSV41_MOONCAKE_SSD_OFFLOAD` | `0` | 1 = 持久层（需 `*_SSD_PATH`） |
-| `DSV41_KVPOOL_STOP_WITH_SERVE` | `0` | 1 = `STOP=1` 同时停 master |
-| `DSV41_PYTHONHASHSEED` | `0` | 缓存 key 跨 rank 一致性 |
+| `DSV41_KV_POOL` | `0` | 1 = 启用外部池；0 = 完全回滚到旧行为 |
+| `DSV41_KV_DRAM_GB` | `2` | **每个 rank** 注册的宿主内存（16 die → 32 GiB） |
+| `DSV41_KV_PROTOCOL` | `host_shm` | 本镜像唯一验证可用的传输 |
+| `DSV41_KV_WORLD_SIZE` | `256` | memcache_hybrid local service 的世界大小 |
+| `DSV41_KV_META_PORT` | `5100` | MetaService RPC |
+| `DSV41_KV_STORE_PORT` | `6100` | config-store RPC |
+| `DSV41_KV_METRICS_PORT` | `8100` | metrics；不能与 vLLM `--port` 相同 |
+| `DSV41_KVPOOL_MIN_FREE_GIB` | `64` | 预检要求保留的宿主内存 |
+| `DSV41_KVPOOL_MAX_MEM_PCT` | `25` | 池总量不得超过 MemTotal 的百分比 |
+| `DSV41_KV_ALLOW_UNFIXED_TREE` | `0` | 1 = 明知源码缺 0101 仍启动（不推荐） |
+| `DSV41_KVPOOL_STOP_WITH_SERVE` | `0` | 1 = `STOP=1` 同时停 MetaService |
 
-引擎侧参数由 `serve.sh` 自动追加：
+`mmc-local.conf`：
 
-```json
---kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both",
-  "kv_connector_extra_config":{"backend":"mooncake","lookup_rpc_port":"0"}}'
+```ini
+ock.mmc.meta_service_url = tcp://127.0.0.1:5100
+ock.mmc.local_service.config_store_url = tcp://127.0.0.1:6100
+ock.mmc.log_level = info
+ock.mmc.local_service.world_size = 256
+ock.mmc.local_service.protocol = host_shm
+ock.mmc.local_service.dram.size = 2GB
 ```
 
-配置写入 `state/kvpool/mooncake.json`（`MOONCAKE_CONFIG_PATH`）。
-`serve.sh` 启动前调用 `scripts/kvpool.sh ensure`：**先做容量预检**，再生成
-配置 + 按需拉起 `mooncake_master`（端口已被监听则复用外部 master）。Docker
-运行时下 master 在容器内启动；容器共享宿主 network/IPC/PID 命名空间，端点一致。
+`mmc-meta.conf`：
 
-## 3. 内存预算（务必先算）
-
-- 注册的内存是 **pin 住的宿主内存**，引擎退出时释放；
-- 总量 = `SEGMENT_SIZE × 卡数`。本机 DP2×TP8 = 16 die：
-  - **32GB/卡 → 512 GiB（默认）**
-  - 16GB/卡 → 256 GiB
-  - 64GB/卡 → 1 TiB（**本机不可用**）
-- 实测边界（2026-11-05）：单进程注册 64 GiB 成功，16 并发注册 64 GiB 也成功
-  （1 TiB 总量、宿主空闲时）；但**引擎启动时**还要占用数百 GiB 宿主内存，
-  64GB/卡 × 16 会在 worker 侧失败：
-
-  ```
-  HcommMemReg failed, ret:19, size:68719476736 bytes
-  register_local_memory_failed ... error=-1
-  RuntimeError: Initialize mooncake failed.   (ret=-600)
-  ```
-
-  失败发生在模型加载完之后，代价是一整轮启动时间，还残留一批持锁 worker，
-  需要 `STOP=1 bash scripts/serve.sh` 清理。
-- 因此 `kvpool.sh` 在启动前做预检（`check-capacity`）：
-  `SEGMENT_SIZE × TP × DP` 必须同时满足
-  `≤ MemTotal × 40%` 且 `≤ MemAvailable − 256 GiB`，否则直接拒绝启动并给出
-  建议值（4 GiB 对齐）。本机默认值：512 GiB ≤ 804 GiB 且 ≤ 1715 GiB，通过。
-- 共享节点上要给其它租户留足余量；当前机器总内存 2 TiB，`/dev/shm` 已被
-  其它任务占用约 220 GiB；内存吃紧时可下调 `SEGMENT_SIZE`（不影响开关语义）。
-
-## 3.1 A3 上的跨卡 P2P：为什么必须 `preferred_segment=1`
-
-默认情况下 master 会把新 block 分配到任意有空闲的 segment（`prefer_alloc_in_same_node`
-只保证同机，不保证同 rank）。于是 rank5 写 block 时可能被分到 rank7 的宿主 segment，
-这次拷贝走 HIXL 跨卡 P2P，在本机 A3 上失败：
-
-```
-E transfer_task.cpp:396] Failed to complete transfers after 60000 milliseconds
-E transfer_executor_base.cpp:258] Connect timeout to: 172.16.0.114:20729
-  halDeviceDisableP2P failed, drvRetCode=17, devIdDes=5, phyIdSrc=7
-ERROR mooncake_backend.py:448] Failed to put 4 keys out of 4. error_codes=[-1]
+```ini
+ock.mmc.meta_service_url = tcp://127.0.0.1:5100
+ock.mmc.meta_service.config_store_url = tcp://127.0.0.1:6100
+ock.mmc.meta_service.metrics_url = http://127.0.0.1:8100
+ock.mmc.log_level = info
 ```
 
-后果不只是丢缓存：60 s 超时重试会持续堆积，最终 `Worker proc VllmWorker-5 died
-unexpectedly`，整个引擎退出（watchdog 随后重启，形成循环）。
+## 4. 内存预算
 
-修复：`preferred_segment=true` 让每个 rank 把 block 写进**自己的** segment，
-写路径退化为本地 NPU→宿主内存拷贝，不需要 P2P。跨 rank 读取仍走 HIXL，
-但前缀路由会把同一前缀固定到同一 rank，所以正常流量几乎不触发；真触发时
-`ASCEND_TRANSFER_TIMEOUT=10s` 保证快速失败而不是卡 60 s。
-
-> 同机 16 卡共享一个 master 的前提是"各写各的 segment"。若将来驱动修好跨卡
-> HIXL，可把 `DSV41_MOONCAKE_PREFERRED_SEGMENT=0` 打开以获得真正的跨 rank
-> 负载均衡。
-
-**实测结论（2026-11-05）**：只做 `preferred_segment=1` 还不够。写路径确实是
-本地的（`Failed to put` 归零），但**读**路径仍会命中别的 rank 的 block：
-
-```
-E client_service.cpp:1139] Transfer failed for key: ...@group:11@cache_role:kv...
-E transfer_executor_base.cpp:597] Transfer failed to: 172.16.0.114:20671
-→ Worker_DP1_TP7 死亡 → EngineDeadError
-```
-
-而前缀路由并不能保证"同一 system prompt 只落一个 rank"：两个不同问题共享
-system prompt 时，router 会按负载分到不同 rank，于是必然触发跨 rank 读。
-所以在本机驱动支持跨卡 HIXL 之前，外部池不可用。
-
-更糟的是崩溃会污染 HIXL：之后即使单独 `TransferEngine().initialize()` 也会报
-`RunAicpuThreadInit ... aicpu exception` 并返回 -1。恢复方式（按代价递增）：
-
-1. 重启服务（不带池）——vLLM 本身不需要 HIXL，可正常服务；
-2. 若仍要试池：`npu-smi set -t reset -i <npu_id> -c <chip_id>` 复位对应芯片
-   （会中断该芯片上的任务）；
-3. 仍不行则重启节点。
-
-启用前请先在**空闲芯片**上验证 HIXL 可用：
+- 注册的是宿主 DRAM，引擎退出时释放；
+- 总量 = `DSV41_KV_DRAM_GB × DP × TP`；
+- 默认 `2 × 2 × 8 = 32 GiB`，对 2 TiB 节点非常保守；
+- 上调前先跑：
 
 ```bash
-python3 - <<'PY'
-import torch, torch_npu
-from mooncake.engine import TransferEngine
-torch.npu.set_device(0)
-print(TransferEngine().initialize("127.0.0.1", "P2PHANDSHAKE", "ascend", ""))  # 0 = OK
-PY
-```
-
-## 4. 启用 / 验证 / 回滚
-
-### 启用（默认已启用）
-
-```bash
-# 容量预检（不启动任何进程）
 bash scripts/kvpool.sh check-capacity
+```
 
-# 只启动 master（幂等；不影响正在运行的引擎）
-bash scripts/kvpool.sh start
+预检要求池同时满足：
+
+```text
+总量 ≤ MemTotal × DSV41_KVPOOL_MAX_MEM_PCT / 100
+总量 ≤ MemAvailable − DSV41_KVPOOL_MIN_FREE_GIB
+```
+
+超限时脚本会拒绝启动并给出建议的 `DSV41_KV_DRAM_GB`，不会等到模型加载
+完才在 worker 里失败。
+
+## 5. 0101 是正确性闸门
+
+`0101-kvpool-mrv2-resume.patch` 清掉 MRV2 抢占恢复后遗留的
+`_preempted_req_ids` 标记。缺它时，下一次 RUNNING delta 会用新的 block
+表覆盖旧的，把**错误的 block** 关联到池 key；之后命中池就会读到别人的
+KV，输出错误但日志不报错。
+
+因此 `kvpool.sh` 在启动 MetaService 前检查源码树：
+
+```bash
+grep -q '_preempted_req_ids.discard(request.req_id)' \
+  <tree>/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+```
+
+缺失时直接 `exit 8`，除非显式设置
+`DSV41_KV_ALLOW_UNFIXED_TREE=1`。补丁由
+`bash scripts/apply_patches.sh apply` 安装，`verify` 也会检查。
+
+## 6. 启用 / 验证 / 回滚
+
+### 启用
+
+```bash
+# 1) 预算 + 配置 + MetaService（不启动 vLLM）
+bash scripts/kvpool.sh ensure
 bash scripts/kvpool.sh status
 
-# 完整启动（含预检 + master + 引擎）
-bash scripts/serve.sh
+# 2) 确认 0101 在树里
+bash scripts/apply_patches.sh verify
+
+# 3) 重启服务，让引擎加载连接器
+STOP=1 bash scripts/serve.sh
+DSV41_KV_POOL=1 bash scripts/serve.sh
 ```
 
-启动日志应出现：
+若要在本机长期启用，把 `config/dsv41.local.env` 改成
+`DSV41_KV_POOL=1` 并冷启动服务。
 
-```
-[kvpool] 容量校验通过：32GB/卡 × 16 = 512 GiB（...）
-[serve] kv_pool=on master=127.0.0.1:50088 segment=32GB/card backend=mooncake config=.../state/kvpool/mooncake.json
-[kvpool] ✅ kv pool 就绪 ...
+### 启动日志
+
+```text
+[kvpool] 容量校验通过：2GB/rank × 16 = 32.0 GiB（...）
+[kvpool] ✅ MetaService 就绪 (pid=...)
+[serve] kv_pool=on backend=memcache protocol=host_shm dram=2GB/rank meta=127.0.0.1:5100
 ```
 
-引擎启动后确认外部命中：
+引擎 worker 日志应出现：
+
+```text
+Creating v1 connector with name: AscendStoreConnector
+```
+
+MetaService metrics：
 
 ```bash
-curl -s http://127.0.0.1:8022/metrics | grep -E "external_prefix_cache_(hits|queries)_total"
-# hits/queries 持续上升 = 外部池在生效
+curl -s http://127.0.0.1:8100/metrics | grep memcache_total_capacity_bytes
 ```
 
-### 回滚（不改代码）
+- 启动前/无 rank 注册时，`dram` 容量是 `0`；
+- 16 个 rank 注册完成后，`dram` 总量应接近 `32 GiB`；
+- 运行中可用 `bash scripts/kvpool.sh status` 查看。
+
+外部池命中指标：
+
+```bash
+curl -s --noproxy '*' http://127.0.0.1:8022/metrics \
+  | grep -E 'external_prefix_cache_(hits|queries)_total'
+```
+
+`hits/queries` 持续上升说明池在生效。刚启动时池为空，需要先跑几次相同
+前缀热身。
+
+### 回滚
 
 ```bash
 # config/dsv41.local.env
 DSV41_KV_POOL=0
-# 然后重启服务（冷启动）
-STOP=1 bash scripts/serve.sh && bash scripts/serve.sh
+
+STOP=1 bash scripts/serve.sh
+bash scripts/serve.sh
 ```
 
-回滚后引擎参数与之前完全一致（不再追加 `--kv-transfer-config`）。
+回滚后不再追加 `--kv-transfer-config`，也不启动 MetaService。
 
-### 停止 master
+### 停止 MetaService
 
 ```bash
-bash scripts/kvpool.sh stop        # 只停本脚本启动的 master
+bash scripts/kvpool.sh stop
 ```
 
-## 5. 注意事项
+只停止本脚本记录在 `DSV41_KV_META_PID_FILE` 里的进程；如果检测到外部
+MetaService，会提示但不会误杀。
 
-1. **DeepSeekV4 是混合注意力模型**：`kv_load_failure_policy=recompute`
-   不支持（rc2 官方文档明确列出），保持默认失败策略；
-2. **内存池不持久**：引擎退出 → 注册段释放 → 缓存清空。需要跨重启保留时
-   启用 SSD offload（`DSV41_MOONCAKE_SSD_OFFLOAD=1` +
-   `DSV41_MOONCAKE_SSD_PATH=/nvme/...`，每个 rank 独立子目录由连接器创建）；
-3. **首次命中需要热身**：HCCS 单边连接惰性建立，参考实现建议先跑
-   2–3× 设备数的 8k/1 请求；
-4. **不要与其它实例共享 `state/`**：每实例独立 `DSV41_STATE_DIR`；共享同一
-   master 时保持相同模型、缓存格式与 `PYTHONHASHSEED`；
-5. Docker 运行时：`state/` 与项目目录按相同路径挂载，配置对容器可见；
-   宿主未安装 `hccn.conf` 时连接器使用驱动默认配置（本项目已验证
-   `hccn_tool` 可读）。
+## 7. 运维注意
 
-## 6. 与 DP lockstep 的关系
+1. **池不持久**：MetaService 退出或引擎退出后注册段释放，缓存清空；
+   当前实现不提供 SSD/持久层。
+2. **不要共享 `state/`**：每个实例独立 `DSV41_STATE_DIR`，否则配置和
+   PID 会互相覆盖。
+3. **端口冲突**：`5100/6100/8100` 不能与 vLLM `--port` 或其它服务冲突；
+   `render-config` 会提前检查。
+4. **Docker 运行时**：`state/` 以相同路径挂载，配置对容器可见；
+   `serve.sh` 在容器内执行 `kvpool.sh ensure`，MetaService 随容器生命周期。
+   因此 `docker stop` 会一并停止池；需要跨容器重启保留池时，改用
+   `DSV41_RUNTIME=native` 或手工在宿主启动 MetaService。
+5. **内核参数**：`host_shm` 使用宿主共享内存；确认 `/dev/shm` 足够大，
+   且没有其它任务占满。池注册的是 DRAM 段，不依赖 `tmpfs` 文件大小，
+   但引擎自身仍会使用 `/dev/shm`（Engram DP shared memory）。
+6. **不要设置 `ASCEND_ENABLE_USE_FABRIC_MEM=1`**：本机驱动会拒绝大块 UC
+   预留；该参数与 MemCache 池无关。
 
-外部 KV 池最大的运行期收益是**减少重复 prefill**：DP2 lockstep 下，任何一个
-rank 的长 prefill 都会让另一个 rank 的 decode 停顿（见
-`docs/troubleshooting.md` 的 lockstep 一节）。长文档第二次问答直接命中外部
-KV 后几乎没有 prefill 步，这类停顿随之消失——这是本方案对交互延迟的主要贡献，
-而不是提升纯 decode 速度。
+## 8. 排障
 
-## 7. 相关命令
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| `MetaService 60s 内未就绪` | 端口占用 / Python 依赖缺失 / `/dev/shm` 不足 | 看 `logs/memcache_meta.log`；`ss -ltnp` 查 5100/6100/8100 |
+| `DSV41_KV_PROTOCOL` 警告 `host_rdma` | 误配了不可用传输 | 改回 `host_shm` |
+| `KV_OFFLOAD 已开启，但源码树不含 0101` | 补丁未应用 | `bash scripts/apply_patches.sh apply`；不要用 `ALLOW_UNFIXED_TREE` 绕过 |
+| `memcache_total_capacity_bytes ... dram 0` | 引擎还没启动/rank 还没注册 | 等引擎 ready 后再查；若一直 0，查 worker 日志的 connector 初始化 |
+| 池启动后 OOM | `DSV41_KV_DRAM_GB` 太大 | `bash scripts/kvpool.sh check-capacity` 后会给出建议值 |
+| 端口 8100 与其它服务冲突 | metrics 端口复用 | 同时改 `DSV41_KV_METRICS_PORT`（或另起实例） |
+
+## 9. 相关命令
 
 ```bash
-make kvpool-status       # master 状态 + 生效配置
-make kvpool-start        # 仅启动 master
-make kvpool-stop         # 停止 master
-bash scripts/kvpool.sh check-capacity # 只做内存预算预检
-bash scripts/kvpool.sh print-env   # 打印全部生效变量
-bash scripts/kvpool.sh render-config  # 重新生成 mooncake.json
+make kvpool-status       # MetaService 状态 + 生效配置
+make kvpool-start        # 仅启动 MetaService（幂等）
+make kvpool-stop         # 停止本脚本启动的 MetaService
+make kvpool-check        # 只做内存预算预检
+bash scripts/kvpool.sh print-env        # 打印全部生效变量
+bash scripts/kvpool.sh render-config    # 重新生成两个 conf
 ```

@@ -122,7 +122,7 @@ vi config/dsv41.local.env
 
 ```bash
 bash scripts/container.sh print-cmd     # 只打印 docker run 命令，先过目
-bash scripts/container.sh up            # 创建/启动容器，并应用 4 个补丁（幂等）
+bash scripts/container.sh up            # 创建/启动容器，并应用 5+1 个补丁（幂等）
 bash scripts/container.sh status
 ```
 

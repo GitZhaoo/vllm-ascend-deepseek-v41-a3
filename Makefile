@@ -1,7 +1,8 @@
-SHELL := /bin/bash
-ROOT  := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+SHELL  := /bin/bash
+ROOT   := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+PYTHON ?= python3
 
-.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart kvpool-start kvpool-stop kvpool-status kvpool-check smoke bench bench8 analyze test lint clean container-up container-down container-status container-shell container-recreate container-cmd probe
+.PHONY: help doctor setup patches verify serve status stop kill watchdog-start watchdog-stop watchdog-status router-restart kvpool-start kvpool-stop kvpool-status kvpool-check smoke bench bench8 analyze test test-patches lint clean container-up container-down container-status container-shell container-recreate container-cmd probe
 
 help:
 	@echo "vllm-ascend-deepseek-v41-a3"
@@ -26,9 +27,9 @@ help:
 	@echo "  make watchdog-status watchdog 状态"
 	@echo "  make watchdog-stop   停止 watchdog（不影响服务）"
 	@echo "  make router-restart  只重启 prefix router（不动 vLLM）"
-	@echo "  make kvpool-status   外部 KV 池（Mooncake master）状态"
-	@echo "  make kvpool-start    只启动 Mooncake master（幂等）"
-	@echo "  make kvpool-stop     停止 Mooncake master（不影响 vLLM）"
+	@echo "  make kvpool-status   外部 KV 池（MemCache MetaService）状态"
+	@echo "  make kvpool-start    只启动 MemCache MetaService（幂等）"
+	@echo "  make kvpool-stop     停止本脚本启动的 MetaService（不影响 vLLM）"
 	@echo "  make kvpool-check    校验 KV 池宿主内存预算（只读）"
 	@echo "  make doctor          只读预检（rootfs/权重/补丁/端口）"
 	@echo "  make smoke           冒烟测试"
@@ -36,6 +37,7 @@ help:
 	@echo "  make bench8          8K 推测解码压测"
 	@echo "  make analyze LOG=... serve 日志分析（停顿占比 / lockstep / KV 饱和）"
 	@echo "  make test            单元测试（patch 状态 / OCI 解包 / router / 日志分析）"
+	@echo "  make test-patches    补丁定向回归（Triton slot mapping / KV 池抢占；需 NPU）"
 	@echo "  make lint            bash -n / py_compile"
 
 doctor:
@@ -122,6 +124,16 @@ analyze:
 
 test:
 	python3 -m unittest discover -s $(ROOT)/tests -v
+
+# These tests need torch_npu and the patched source tree. They import
+# vllm / vllm_ascend, so PYTHONPATH must reach both trees inside the rootfs.
+# Override ROOTFS / PYTHON if your tree lives elsewhere, e.g.
+#   make test-patches ROOTFS=/cache/dsv41-rc2-rootfs \
+#     PYTHON=/cache/dsv41-rc2-rootfs/usr/local/python3.12*/bin/python3.12
+ROOTFS ?= /cache/dsv41-rc2-rootfs
+test-patches:
+	PYTHONPATH=$(ROOTFS)/vllm-workspace/vllm-ascend:$(ROOTFS)/vllm-workspace/vllm:$${PYTHONPATH:-} \
+	  $(PYTHON) -m pytest $(ROOT)/tests/ut -q
 
 lint:
 	@for f in $(ROOT)/scripts/*.sh $(ROOT)/examples/*.sh; do bash -n "$$f" || exit 1; done

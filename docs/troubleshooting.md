@@ -25,8 +25,10 @@ tail -n 200 logs/serve_*.log
 | `No module named vllm_ascend` | `PYTHONPATH` 顺序/路径错误 | 用 `serve.sh`；确认 rootfs 解包完整 |
 | 启动极慢或卡在权重加载 | NFS 抖动、页缓存不足、CPU 绑核冲突 | 本地盘 + 足够内存；确认 `free -g` |
 | `ASCEND_HOME_PATH` 相关错误 | 指向了 `ascend-toolkit/latest` 符号链接 | 指向具体目录 `cann-9.2.0`（`serve.sh` 已这样做） |
-| `Failed to put N keys ... error_codes=[-1]` + `halDeviceDisableP2P failed, ret:17` + 随后 worker 死亡 | KV 池把 block 分配到别人的 segment，触发跨卡 HIXL P2P（本机 A3 不可用） | 保持 `DSV41_MOONCAKE_PREFERRED_SEGMENT=1`（默认），写路径只走本地 segment |
-| `RuntimeError: Initialize mooncake failed.`（ret=-600） | KV 池申请超过节点可 pin 的宿主内存：worker 侧 `HcommMemReg failed, ret:19`（实测 64GB/卡 × 16 = 1 TiB 会触发） | `bash scripts/kvpool.sh check-capacity` 看建议值；把 `DSV41_MOONCAKE_SEGMENT_SIZE` 降到 32GB（默认）后重启 |
+| `MetaService 60s 内未就绪` | 5100/6100/8100 被占用、`/dev/shm` 不足或 `memcache_hybrid` 依赖缺失 | 看 `logs/memcache_meta.log`；`ss -ltnp` 查端口；`bash scripts/kvpool.sh status` |
+| `KV_OFFLOAD 已开启，但源码树不含 0101` | **措辞沿用参考部署**：本仓库对应 `DSV41_KV_POOL=1`。外部池启用了，但 MRV2 抢占恢复补丁没应用；缺它会静默算错 | `bash scripts/apply_patches.sh apply`；不要用 `DSV41_KV_ALLOW_UNFIXED_TREE=1` 绕过 |
+| `host_rdma` 0 字节 / 8 rank segfault | 传输配错：本镜像只有 `host_shm` 可用 | 设回 `DSV41_KV_PROTOCOL=host_shm`；不要给容器注入 `-e LD_LIBRARY_PATH` |
+| `vllm/version.py` 仍报 rc2、`_version.py` 仍是旧版本号 | 补丁不改动版本文件，版本号**不是**补丁/代码真实状态的判据 | 用 `bash scripts/apply_patches.sh status` 看补丁与 gate 真实状态 |
 
 ---
 

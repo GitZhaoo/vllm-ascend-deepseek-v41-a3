@@ -25,20 +25,20 @@
 - **生产级启动参数**：DP2/TP8、Model Runner V2、DSpark K=5、FULL_DECODE_ONLY
   37 个 ACL graph 桶、1M 上下文、prefix caching、`prompt_tokens_details`、
   Engram CPU offload。
-- **4 个已实测补丁 + 6 个优化 gate**：默认值固化进源码树，规避 spawn worker
-  不继承环境变量导致的静默失效。
+- **5 个 vllm-ascend 补丁 + 1 个 vllm 补丁 + 6 个优化 gate**：默认值固化进源码树，
+  规避 spawn worker 不继承环境变量导致的静默失效；另含 KV 池 MRV2 抢占修复和
+  DeepSeek-V4.1 tokenizer 控制 token 逃逸 / 空 developer 消息修复。
 - **前缀/ KV 感知路由**：external LB 模式下 DP0/DP1 各自监听独立端口，router 消费
   vLLM KV 事件，按最长 token 前缀把相同 system prompt / 长文档粘到同一 rank；
   默认的 `cost` 策略以 token 为单位给各 rank 打分（未命中 prompt + prefill 排队量 +
   KV 饱和罚分），不再只看请求数，`DSV41_ROUTER_POLICY=legacy` 可回退。详见
   [`docs/router.md`](docs/router.md)。
-- **外部 KV 池（Mooncake / AscendStoreConnector，本机暂由 local.env 关闭）**：prefix cache 的
-  KV block 扩展进宿主内存（默认 32GB/卡，16 die ≈ 512 GiB ≈ 显存 KV 的 4.6 倍），
-  长文档 / 多轮对话 / 共享 system prompt 跨请求、跨 DP rank 命中，避免重复
-  prefill；`DSV41_KV_POOL=0` 可一键回滚。**注意**：A3 910C 当前驱动的跨卡
-  HIXL 不可用（`halDeviceDisableP2P ret:17`），本机已在
-  `config/dsv41.local.env` 关闭该特性；驱动修好后改回 1 即可。详见
-  [`docs/kv-pool.md`](docs/kv-pool.md) 第 3.1 节。
+- **外部 KV 池（AscendStoreConnector + MemCache，opt-in）**：对齐参考部署
+  `vllm-ascend-deepseek-v41-a2`，由 `memcache_hybrid` MetaService + `host_shm`
+  把 prefix cache 的 KV block 扩展进宿主内存（默认 2GB/rank，16 die ≈ 32 GiB）。
+  不经过跨卡 HIXL，因此避开本机 A3 的 `halDeviceDisableP2P ret:17`；启用前
+  强制校验 0101（MRV2 抢占恢复）正确性补丁。`DSV41_KV_POOL=1` 打开、
+  `0` 回滚。详见 [`docs/kv-pool.md`](docs/kv-pool.md)。
 - **日志分析**：`scripts/analyze_serve_log.py` 从 serve 日志量化输出 tok/s 的停顿占比、
   两个 rank 的 lockstep 耦合、KV 饱和，用于前后对比（`docs/performance.md` 第 7 节）。
 - **无人值守**：`watchdog.sh` 轮询 `/health`，宽限期 + 自动重启 + 日志轮转。
@@ -47,45 +47,41 @@
 ## 实测吞吐
 
 单机 8×910C（DP2/TP8），`completions` 接口，约 2K prompt / 256 output，
-temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**，
-2026-11-02 实测（机器无其它在线流量）：
+temperature=0，DSpark 推测解码；**16384 批次 + external LB/router**。
+下表为 **2026-11-05 当前运行实例实测**（外部 KV 池 `host_shm` 开启，
+`scripts/bench_2k.py` / `scripts/bench_dual.py`，每档 3 发中位；压测窗口内
+serve 日志无其它在线请求）：
 
-| 并发 | 单前缀总吞吐 (tok/s) | 双前缀总吞吐 (tok/s) |
-|---:|---:|---:|
-| 1 | 87.9 | — |
-| 2 | 163.7 | 192.1 |
-| 4 | 317.5 | 360.4 |
-| 8 | 473.6 | 672.9 |
-| 16 | 1038.8 | 1084.7 |
-| 32 | 1831.6 | **2253.4** |
+| 并发 | 单前缀总吞吐 (tok/s) | 单前缀单流 | 单前缀 TTFT | 双前缀总吞吐 (tok/s) | 双前缀单流 | 双前缀 TTFT |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 87.6 | 98.4 | 308 ms | — | — | — |
+| 2 | 186.1 | 104.7 | 295 ms | 177.9 | 107.6 | 479 ms |
+| 4 | 340.0 | 95.8 | 305 ms | 333.2 | 100.8 | 515 ms |
+| 8 | 645.1 | 91.9 | 336 ms | 729.3 | 108.7 | 379 ms |
+| 16 | 1,101.9 | 80.8 | 618 ms | 1,292.9 | 94.2 | 405 ms |
+| 32 | 1,834.6 | 73.7 | 667 ms | **1,938.9** | 69.4 | 460 ms |
+| 64 | — | — | — | **2,009.8**（持续×12 波） | 54.9 | 671 ms |
 
 单前缀是同一热 prompt；双前缀用 `scripts/bench_dual.py` 让两个长前缀分别落到
-两个 DP rank，更接近 DP2 实际并发能力。8K→1024 双前缀 @c16 实测约 1.34k tok/s；
-完整表和方法见 [`docs/performance.md`](docs/performance.md)。
+两个 DP rank，更接近 DP2 实际并发能力。
 
-**2026-11-04 并发压力复测**（未重启服务，与 2026-11-02 相同 2K/256 口径）——
-容量与稳定性结论一致：
+- 单前缀曲线与 2026-11-04 基本一致（C=32：1,835 vs 1,933 tok/s）；
+- 本次双前缀 C=32/C=64 为 1,939 / 2,010 tok/s，低于 2026-11-04 的 2,124 / 3,185；
+  当前实例已连续运行约 2.5 小时且外部 KV 池开启，和历史数据不是同一实例状态，
+  **不能直接归因**；容量规划建议以本次当前实例数据为准，并在重启后复测；
+- 压测全程 serve 日志 0 条失败请求（`/v1/completions` 全部 200），结束后两 rank
+  active 归零；
+- 历史 2026-11-02 / 2026-11-04 数据与批次 A/B 见
+  [`docs/performance.md`](docs/performance.md)。
 
-| 并发 | 口径 | 总吞吐 (tok/s) | 单流 (tok/s) | TTFT (ms) | 失败 |
-|---:|---|---:|---:|---:|---:|
-| 1 | 单前缀 | 87.7 | 96.5 | 276 | 0 |
-| 2 | 单前缀 | 163.1 | 91.0 | 298 | 0 |
-| 4 | 单前缀 | 311.7 | 88.3 | 347 | 0 |
-| 8 | 单前缀 | 496.6 | 69.6 | 353 | 0 |
-| 16 | 单前缀 | 1,044.6 | 73.1 | 347 | 0 |
-| 32 | 单前缀 | 1,932.7 | 72.8 | 609 | 0 |
-| 16 | 双前缀 | 1,238.4 | 93.6 | 388 | 0 |
-| 32 | 双前缀 | 2,123.8 | 82.4 | 665 | 0 |
-| 64 | 双前缀 | 3,116.8 | 64.4 | 822 | 0 |
-| 64 持续×12 波 | 双前缀 | **3,184.6** | 63.1 | 808 | 0 |
+**8K 复测（2026-11-05）**：单前缀 8K→1024 在 C=1/4/8/16 为
+105.8 / 411.0 / 842.8 / 1,452.4 tok/s；双前缀 8K→1024 在 C=2/4/8/16 为
+210.7 / 403.9 / 764.8 / **1,392.0** tok/s（接受率 51.3–51.6%，
+tokens/step ≈ 3.57）。完整表见 [`docs/performance.md`](docs/performance.md)。
 
-- C=64 已超过单 rank `max_num_seqs=32` 的排队上限，靠 DP2 分摊 + router 亲和消化，
-  总吞吐仍随并发增长且持续压测与短时突发持平（无衰减）；
-- 压测全程 serve 日志 **0 条失败请求**（`/v1/completions` 全部 200），结束后两 rank
-  active 归零、`/router/stats` 无 fallback 激增。
-
-**2026-11-04 批次 A/B（`DSV41_MAX_NUM_BATCHED_TOKENS` 8192 vs 16384）**，
-同机同口径（2K prompt / 256 output、cost 路由、引擎前缀缓存热）实测：
+**历史：2026-11-04 批次 A/B（`DSV41_MAX_NUM_BATCHED_TOKENS` 8192 vs 16384）**，
+同机同口径（2K prompt / 256 output、cost 路由、引擎前缀缓存热）实测。
+下表保留当时实例的数据，**不能与上面的 2026-11-05 当前实例直接相减**：
 
 | 口径 | 并发 | 16384 (tok/s) | 8192 (tok/s) | Δ |
 |---|---:|---:|---:|---:|
@@ -225,7 +221,7 @@ modelscope download --model Eco-Tech/DeepSeek-V4.1-Flash-1017-w8a8 \
 # 3) 解包 rc2-a3 rootfs（约 21 GB，自动处理 OCI whiteout）
 bash scripts/setup_rootfs.sh
 
-# 4) 应用 4 个优化补丁（幂等）
+# 4) 应用 5 个 vllm-ascend 补丁 + 1 个 vllm 补丁（幂等）
 bash scripts/apply_patches.sh apply
 bash scripts/apply_patches.sh verify
 
@@ -296,8 +292,8 @@ curl --noproxy '*' http://127.0.0.1:8021/v1/chat/completions \
 | [deployment.md](docs/deployment.md) | 从零到可服务的完整步骤与校验点（rootfs 直跑） |
 | [architecture.md](docs/architecture.md) | rootfs 隔离、DP/TP 进程拓扑、端口与 PID |
 | [performance.md](docs/performance.md) | 实测吞吐、显存模型、每个参数的收益与代价 |
-| [kv-pool.md](docs/kv-pool.md) | 外部 KV 池（Mooncake / AscendStoreConnector）：容量、内存预算、启用与回滚 |
-| [patches.md](docs/patches.md) | 4 个补丁、6 个 gate、为什么默认值必须是 1 |
+| [kv-pool.md](docs/kv-pool.md) | 外部 KV 池（AscendStoreConnector + MemCache）：容量、启用与回滚 |
+| [patches.md](docs/patches.md) | 5+1 个补丁、6 个 gate、内容指纹与回归测试 |
 | [troubleshooting.md](docs/troubleshooting.md) | 症状 → 原因 → 修复 |
 | [api.md](docs/api.md) | OpenAI 兼容接口、SDK、Claude Code |
 

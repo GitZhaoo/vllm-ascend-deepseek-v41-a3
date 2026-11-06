@@ -99,58 +99,46 @@ export DSV41_API_KEY DSV41_SERVE_PID_FILE DSV41_WATCHDOG_PID_FILE DSV41_ROUTER_P
 export DSV41_DP_BASE_PORT DSV41_DP_SUPERVISOR_PORT
 export DSV41_RUNTIME DSV41_IMAGE DSV41_CONTAINER DSV41_STATE_DIR DSV41_INSTANCE_ID
 
-# ---- external KV pool (Mooncake / AscendStoreConnector) --------------------
-# Enabled by default: prefix-cache blocks spill into host memory so repeated
-# prefixes (long documents, multi-turn chat, shared prompts) are reused across
-# requests AND across DP ranks instead of being recomputed.
-#   DSV41_KV_POOL=0                     rollback to the previous behaviour
-#   DSV41_MOONCAKE_SEGMENT_SIZE=32GB    host RAM registered per card/die
-#                                       (16 dies here → 512 GiB pinned total)
-#   DSV41_MOONCAKE_MASTER=host:port     mooncake_master RPC endpoint
-#   DSV41_MOONCAKE_SSD_OFFLOAD=1        persistent tier (needs *_SSD_PATH),
-#                                       survives engine restarts
-# Memory is pinned while the engine runs and released when it exits; budget it
-# against the other tenants of a shared node. See docs/kv-pool.md.
+# ---- external KV pool (AscendStoreConnector + MemCache) --------------------
+# Optional and OFF by default; enable with DSV41_KV_POOL=1.
 #
-# 32GB × 16 dies = 512 GiB is the largest default that leaves headroom on this
-# 2 TiB node: the engine itself touches several hundred GiB of host memory
-# during startup, and 64GB × 16 (1 TiB) made HcommMemReg fail (ret:19) inside
-# the workers. kvpool.sh check-capacity enforces the budget before launch.
-: "${DSV41_KV_POOL:=1}"
+# This follows the reference deployment (CJYLZS/vllm-ascend-deepseek-v41-a2):
+# AscendStoreConnector talks to memcache_hybrid's MetaService over host shared
+# memory (KV_PROTOCOL=host_shm). Do NOT switch to host_rdma/device_rdma:
+#   * host_rdma's extend library is a 0-byte stub in this image;
+#   * device_rdma works on one rank but segfaults with 8+ ranks.
+# The MetaService is a CPU-only process; no HBM/card is consumed.
+#   DSV41_KV_POOL=1                  enable the pool
+#   DSV41_KV_DRAM_GB=2               DRAM per rank (16 dies -> 32 GB total)
+#   DSV41_KV_PROTOCOL=host_shm       fixed for this image
+#   DSV41_KV_META_PORT=5100          MetaService RPC
+#   DSV41_KV_STORE_PORT=6100         config-store RPC
+#   DSV41_KV_METRICS_PORT=8100       metrics (cannot equal the vLLM --port)
+#   DSV41_KV_ALLOW_UNFIXED_TREE=0    refuse to start without patch 0101
+# Memory is registered by each worker at engine start and released on exit.
+# See docs/kv-pool.md.
+: "${DSV41_KV_POOL:=0}"
 : "${DSV41_KVPOOL_STATE_DIR:=$DSV41_STATE_DIR/kvpool}"
-: "${DSV41_MOONCAKE_MASTER:=127.0.0.1:50088}"
-: "${DSV41_MOONCAKE_METRICS_PORT:=9003}"
-: "${DSV41_MOONCAKE_SEGMENT_SIZE:=32GB}"
-# Write into the writer's own segment. Without this the master may place a block
-# on another rank's host segment, and the copy becomes a cross-NPU HIXL transfer
-# that fails on this A3 node (halDeviceDisableP2P ret:17, 60 s timeouts, then a
-# dead worker). Cross-rank reads are rare because the prefix router pins a
-# prefix to one rank.
-: "${DSV41_MOONCAKE_PREFERRED_SEGMENT:=1}"
-# Bound HIXL connect/transfer attempts so a cross-rank miss degrades in seconds
-# instead of hanging the request for the 60 s default.
-: "${DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS:=10000}"
-: "${DSV41_KVPOOL_MIN_FREE_GIB:=256}"    # keep this much RAM free for the engine
-: "${DSV41_KVPOOL_MAX_MEM_PCT:=40}"      # never let the pool exceed this % of RAM
+: "${DSV41_KV_DRAM_GB:=2}"
+: "${DSV41_KV_PROTOCOL:=host_shm}"
+: "${DSV41_KV_WORLD_SIZE:=256}"
+: "${DSV41_KV_META_PORT:=5100}"
+: "${DSV41_KV_STORE_PORT:=6100}"
+: "${DSV41_KV_METRICS_PORT:=8100}"
+: "${DSV41_KV_BACKEND:=memcache}"
+: "${DSV41_KV_META_LOG:=$DSV41_RESULTS/memcache_meta.log}"
+: "${DSV41_KV_META_PID_FILE:=$DSV41_PID_DIR/dsv41_memcache_meta.pid}"
+: "${DSV41_KV_ALLOW_UNFIXED_TREE:=0}"
+: "${DSV41_KVPOOL_STOP_WITH_SERVE:=0}"   # 1: STOP=1 also stops MetaService
+: "${DSV41_KVPOOL_MIN_FREE_GIB:=64}"     # keep this much RAM free for the engine
+: "${DSV41_KVPOOL_MAX_MEM_PCT:=25}"      # never let the pool exceed this % of RAM
 : "${DSV41_MEMINFO_FILE:=/proc/meminfo}" # override for tests/containers
-: "${DSV41_MOONCAKE_LOCAL_BUFFER:=1GB}"
-: "${DSV41_MOONCAKE_BACKEND:=mooncake}"
-: "${DSV41_MOONCAKE_TENANT:=default}"
-: "${DSV41_MOONCAKE_SSD_OFFLOAD:=0}"
-: "${DSV41_MOONCAKE_SSD_PATH:=}"
-: "${DSV41_MOONCAKE_LOG:=$DSV41_RESULTS/mooncake_master.log}"
-: "${DSV41_MOONCAKE_PID_FILE:=$DSV41_PID_DIR/dsv41_mooncake.pid}"
-: "${DSV41_KVPOOL_STOP_WITH_SERVE:=0}"   # 1: STOP=1 also stops the master
-: "${DSV41_PYTHONHASHSEED:=0}"           # stable cache keys across ranks
 
-export DSV41_KV_POOL DSV41_KVPOOL_STATE_DIR DSV41_MOONCAKE_MASTER
-export DSV41_MOONCAKE_METRICS_PORT DSV41_MOONCAKE_SEGMENT_SIZE
-export DSV41_MOONCAKE_LOCAL_BUFFER DSV41_MOONCAKE_BACKEND DSV41_MOONCAKE_TENANT
-export DSV41_MOONCAKE_SSD_OFFLOAD DSV41_MOONCAKE_SSD_PATH
+export DSV41_KV_POOL DSV41_KVPOOL_STATE_DIR DSV41_KV_DRAM_GB DSV41_KV_PROTOCOL
+export DSV41_KV_WORLD_SIZE DSV41_KV_META_PORT DSV41_KV_STORE_PORT DSV41_KV_METRICS_PORT
+export DSV41_KV_BACKEND DSV41_KV_META_LOG DSV41_KV_META_PID_FILE
+export DSV41_KV_ALLOW_UNFIXED_TREE DSV41_KVPOOL_STOP_WITH_SERVE
 export DSV41_KVPOOL_MIN_FREE_GIB DSV41_KVPOOL_MAX_MEM_PCT DSV41_MEMINFO_FILE
-export DSV41_MOONCAKE_PREFERRED_SEGMENT DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS
-export DSV41_MOONCAKE_LOG DSV41_MOONCAKE_PID_FILE DSV41_KVPOOL_STOP_WITH_SERVE
-export DSV41_PYTHONHASHSEED
 
 # ---- helpers ---------------------------------------------------------------
 

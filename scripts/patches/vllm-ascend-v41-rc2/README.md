@@ -1,7 +1,9 @@
 # DeepSeek-V4.1 optimization patches for vLLM Ascend v0.30.0rc2
 
 These patches are applied to the `vllm-ascend` source tree inside the
-`v0.30.0rc2-a3` rootfs and are enabled by `scripts/serve.sh`.
+`v0.30.0rc2-a3` rootfs and are enabled by `scripts/serve.sh`. The sibling
+`../vllm-ced6857af/` directory holds the vllm-side tokenizer safety patch;
+`scripts/apply_patches.sh` applies both trees.
 
 Baseline: **vllm-ascend v0.30.0rc2** (`8fde6d4e3`) shipped in
 `quay.nju.edu.cn/ascend/vllm-ascend:v0.30.0rc2-a3`, paired with **vllm 0.30.0**.
@@ -15,6 +17,7 @@ the V4.1 path on A3 are kept.
 | `0002-dsa-v41.patch` | DSA-V4.1 metadata builder optimizations + Triton slot-mapping gate |
 | `0004-model-opts.patch` | Engram WKV TP sharding, indexer QLI mode 3, MoE mask-range dispatch, RoPE `index_select` |
 | `0005-packed-cache-slot-mapping-scalar.patch` | Build the packed-cache slot mapping with a single scalar Triton launch instead of an eager op chain |
+| `0101-kvpool-mrv2-resume.patch` | Clear the MRV2 preempted-request marker in `_process_new_request` so KV-pool keys keep the correct block table |
 | `series.conf` | Application order |
 
 Patches touch Python only. The prebuilt `.so` files in the image remain valid.
@@ -32,14 +35,14 @@ warning while the gate evaluates to `0`).
 * `engram/layer.py`, `model.py`, `indexer.py`, `token_dispatcher.py` — module-level `os.environ.get("GATE", "0")` → `..., "1")` (4 gates)
   (`layer.py` and `model.py` read the Engram WKV gate independently; both must be pinned)
 
-`scripts/apply_patches.sh verify` checks all six definitions and their defaults.
+`scripts/apply_patches.sh verify` checks all six definitions and their defaults,
+the `0101` KV-pool preemption fix, and the sibling `vllm` tokenizer patch.
 
 ## Removed patches
 
 | File | Reason |
 |------|--------|
 | `0003-dsa-v1-o-proj-2d.patch` | V4.1 uses `AscendDSAV41Impl`; `dsa_v1.AscendDSAImpl._wo_a_bmm` is not executed |
-| `0101-kvpool-mrv2-resume.patch` | Requires `--kv-transfer-config`; this deployment does not attach an external KV pool |
 
 ## Usage
 

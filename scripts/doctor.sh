@@ -187,7 +187,9 @@ fi
 section "补丁"
 if { [ "$DSV41_RUNTIME" = "docker" ] && [ "$CONTAINER_RUNNING" = 1 ]; } \
    || { [ "$DSV41_RUNTIME" != "docker" ] && [ -f "$DSV41_ROOTFS/vllm-workspace/vllm-ascend/vllm_ascend/envs.py" ]; }; then
-  if bash "$SELF_DIR/apply_patches.sh" status 2>/dev/null | grep -q 'verify.*✅'; then
+  patch_status=$(bash "$SELF_DIR/apply_patches.sh" status 2>/dev/null)
+  patch_rc=$?
+  if [ "$patch_rc" -eq 0 ] && grep -q 'verify.*✅' <<<"$patch_status"; then
     ok "补丁与 gate 默认值正常"
   else
     warn "补丁状态异常，运行 bash scripts/apply_patches.sh status"
@@ -239,6 +241,74 @@ if [ "${DSV41_LB_MODE:-internal}" = "external" ]; then
       ok "external 端口 $p 空闲（服务未运行时正常）"
     fi
   done
+fi
+
+section "运行期开关"
+if [ -n "$pid" ]; then
+  want_npus=$((DSV41_DP * DSV41_TP))
+
+  # Worker / engine environment: read from the running processes, not the
+  # doctor shell (serve.sh exports these into the engine's environment).
+  hccl_det=""
+  hccl_aiv=""
+  for p in $(dsv41_instance_pids 2>/dev/null); do
+    [ -r "/proc/$p/environ" ] || continue
+    v=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null)
+    [ -z "$hccl_det" ] && hccl_det=$(printf '%s\n' "$v" | sed -n 's/^HCCL_DETERMINISTIC=//p' | head -n1)
+    [ -z "$hccl_aiv" ] && hccl_aiv=$(printf '%s\n' "$v" | sed -n 's/^HCCL_OP_EXPANSION_MODE=//p' | head -n1)
+  done
+
+  if [ "$DSV41_RUNTIME" = "docker" ]; then
+    # plog/serve logs live in the state dir mounted into the container.
+    plog_root="${DSV41_STATE_DIR}/ascend/log/run/plog"
+    v2_src=""
+    if command -v "$DSV41_DOCKER_BIN" >/dev/null 2>&1 && "$DSV41_DOCKER_BIN" inspect -f '{{.State.Running}}' "$DSV41_CONTAINER" >/dev/null 2>&1; then
+      v2_src="$("$DSV41_DOCKER_BIN" logs "$DSV41_CONTAINER" 2>/dev/null)"
+    fi
+  else
+    plog_root="${DSV41_PLOG_DIR:-/root/ascend/log/run/plog}"
+    v2_src=""
+    latest_serve=$(ls -t "$DSV41_RESULTS"/serve_*.log 2>/dev/null | head -n 1 || true)
+    [ -n "$latest_serve" ] && v2_src=$(cat "$latest_serve" 2>/dev/null)
+  fi
+  if [ -z "$v2_src" ]; then
+    warn "找不到 serve 日志，无法确认 V2 model runner"
+  else
+    v2_ranks=$(printf '%s\n' "$v2_src" | grep -c 'npu model runner v2 is in developing')
+    if [ "${v2_ranks:-0}" -ge "$want_npus" ]; then
+      ok "V2 model runner 已生效（${v2_ranks}/${want_npus} rank）"
+    else
+      warn "V2 model runner 日志只看到 ${v2_ranks:-0}/${want_npus} rank（V1 判据在 V2 下恒为 0，不要用旧判据）"
+    fi
+  fi
+
+  # AIV: count ranks whose plog emitted aivMode[1].
+  aiv_ranks=0
+  if [ -d "$plog_root" ]; then
+    for p in $(dsv41_instance_pids 2>/dev/null); do
+      f=$(find "$plog_root" -maxdepth 1 -type f -name "plog-${p}_*" -print -quit 2>/dev/null || true)
+      if [ -n "$f" ] && grep -q 'aivMode\[1\]' "$f" 2>/dev/null; then
+        aiv_ranks=$((aiv_ranks + 1))
+      fi
+    done
+    if [ "$aiv_ranks" -ge "$want_npus" ]; then
+      ok "HCCL AIV 已生效（plog aivMode[1]：${aiv_ranks}/${want_npus} rank）"
+    else
+      bad "HCCL AIV 未确认（plog aivMode[1]：${aiv_ranks}/${want_npus} rank；检查 HCCL_OP_EXPANSION_MODE / HCCL_DETERMINISTIC）"
+    fi
+  else
+    warn "找不到 plog 目录 $plog_root，无法确认 AIV（HCCL_OP_EXPANSION_MODE=$hccl_aiv）"
+  fi
+
+  case "${hccl_det:-}" in
+    1|true|TRUE|on|ON) warn "HCCL_DETERMINISTIC=$hccl_det 会静默压掉 AIV 展开，确认是否为压测临时设置" ;;
+  esac
+  case "${hccl_aiv:-AIV}" in
+    AIV) ;;
+    *) warn "HCCL_OP_EXPANSION_MODE=$hccl_aiv（非 AIV）；serve.sh 默认传 AIV，确认是否被覆盖" ;;
+  esac
+else
+  ok "服务未运行，跳过运行期开关自证"
 fi
 
 section "代理环境"

@@ -123,7 +123,7 @@ if [ "${STOP:-0}" = "1" ]; then
   if [ "$DSV41_KVPOOL_STOP_WITH_SERVE" = "1" ]; then
     bash "$SELF_DIR/kvpool.sh" stop || true
   elif [ "$DSV41_KV_POOL" = "1" ]; then
-    echo "[serve] mooncake_master 仍在运行；需要时: bash scripts/kvpool.sh stop"
+    echo "[serve] MemCache MetaService 仍在运行；需要时: bash scripts/kvpool.sh stop"
   fi
   echo "[serve] 已停"
   exit 0
@@ -275,23 +275,10 @@ export LD_LIBRARY_PATH="$CANN/lib64:$CANN/lib64/plugin/opskernel:$CANN/lib64/plu
 export PATH="$CANN/bin:$PYTHON_HOME_DIR/bin:${PATH:-}"
 export PYTHONPATH="$CANN/python/site-packages:$PYTHONPATH"
 
-# Stable string hashing keeps prefix-cache keys reproducible across ranks and
-# instances (required by the Mooncake pool, harmless otherwise).
-# PYTHONHASHSEED is only needed by the Mooncake KV pool (reproducible cache keys
-# across ranks). With the pool off it stays unset so interpreter behaviour
-# matches the pre-pool baseline: vLLM derives the prefix-cache root seed from
-# PYTHONHASHSEED when present, so pinning it changes hash-derived state for the
-# whole engine even with DSV41_KV_POOL=0.
-if [ "$DSV41_KV_POOL" = "1" ] && [ -n "${DSV41_PYTHONHASHSEED:-}" ]; then
-  export PYTHONHASHSEED="$DSV41_PYTHONHASHSEED"
-else
-  unset PYTHONHASHSEED 2>/dev/null || true
-fi
-
 # Environment probe:  DSV41_PROBE=1 bash scripts/serve.sh
 # Imports the stack with the exact serving environment (rootfs/container Python,
 # CANN, host driver libs), prints versions and the visible NPU count, and exits.
-# Must stay before the KV-pool bootstrap: probing must not start mooncake_master.
+# Must stay before the KV-pool bootstrap: probing must not start MetaService.
 if [ "${DSV41_PROBE:-0}" = "1" ]; then
   exec "$PY" -c '
 import torch, torch_npu
@@ -302,36 +289,21 @@ print("vllm", vllm.__version__, "vllm_ascend", getattr(vllm_ascend, "__version__
 '
 fi
 
-# ---- external KV pool (Mooncake / AscendStoreConnector) --------------------
-# ensure: writes state/kvpool/mooncake.json and starts mooncake_master if the
-# configured master endpoint is not already served. Runs after the container
-# hand-off, so with DSV41_RUNTIME=docker the master lives inside the container
-# (host network namespace → same endpoint for the host).
+# ---- external KV pool (AscendStoreConnector + MemCache) -------------------
+# Mirrors CJYLZS/vllm-ascend-deepseek-v41-a2's kv_offload.sh: a CPU-only
+# MetaService speaks memcache_hybrid over host_shm; each rank registers
+# DSV41_KV_DRAM_GB of host RAM and the engine gets AscendStoreConnector with
+# backend=memcache. It deliberately does NOT use Mooncake/HIXL: on this A3 node
+# cross-card HIXL fails (halDeviceDisableP2P ret:17), while host_shm does not
+# touch HIXL at all. The script also enforces the 0101 MRV2-preemption fix.
 KVPOOL_JSON=""
 if [ "$DSV41_KV_POOL" = "1" ]; then
   if ! KVPOOL_CFG=$(bash "$SELF_DIR/kvpool.sh" ensure); then
     echo "[serve] ❌ 外部 KV 池未就绪，已中止启动（修好容量/配置后重试，或 DSV41_KV_POOL=0 回滚）" >&2
     exit 1
   fi
-  export MOONCAKE_CONFIG_PATH="$KVPOOL_CFG"
-  # Route the store through its own transfer path instead of the engine-global
-  # HIXL TE: on this A3 node the global-TE path fails cross-rank copies
-  # (halDeviceDisableP2P ret:17) and AdxlEngine init fails outright when a vLLM
-  # engine is already holding the devices. An empty JSON object is enough to
-  # flip MooncakeBackend onto the store-independent path (see its __init__).
-  if [ -z "${ASCEND_GLOBAL_RESOURCE_CONFIG:-}" ]; then
-    export ASCEND_GLOBAL_RESOURCE_CONFIG='{}'
-  fi
-  # A3 fabric-mem path: bypasses HIXL entirely, but measured 2026-11-05 to fail
-  # on this 910C node (aclrtReserveMemAddressNoUCMemory ret:107000, the driver
-  # rejects the 32 TiB UC reservation) -> engine startup dies. Opt-in only:
-  # export ASCEND_ENABLE_USE_FABRIC_MEM=1 when the driver supports it.
-  : "${ASCEND_ENABLE_USE_FABRIC_MEM:=0}"
-  export ASCEND_ENABLE_USE_FABRIC_MEM  # Bound HIXL connect/transfer retries (default 60 s blocks a request for a
-  # minute when a peer segment is unreachable).
-  export ASCEND_CONNECT_TIMEOUT="${ASCEND_CONNECT_TIMEOUT:-$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS}"
-  export ASCEND_TRANSFER_TIMEOUT="${ASCEND_TRANSFER_TIMEOUT:-$DSV41_MOONCAKE_TRANSFER_TIMEOUT_MS}"
-  KVPOOL_JSON=$(printf '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"%s","lookup_rpc_port":"0"}}' "$DSV41_MOONCAKE_BACKEND")
+  export MMC_LOCAL_CONFIG_PATH="$KVPOOL_CFG"
+  KVPOOL_JSON='{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"memcache"}}'
 fi
 
 # ---- compose arguments -----------------------------------------------------
@@ -396,7 +368,7 @@ fi
 # ---- launch ----------------------------------------------------------------
 echo "[serve] runtime=$DSV41_RUNTIME ROOTFS=$DSV41_ROOTFS instance=$DSV41_INSTANCE_ID offline=$DSV41_OFFLINE"
 if [ "$DSV41_KV_POOL" = "1" ]; then
-  echo "[serve] kv_pool=on master=$DSV41_MOONCAKE_MASTER segment=${DSV41_MOONCAKE_SEGMENT_SIZE}/card backend=$DSV41_MOONCAKE_BACKEND config=$MOONCAKE_CONFIG_PATH"
+  echo "[serve] kv_pool=on backend=$DSV41_KV_BACKEND protocol=$DSV41_KV_PROTOCOL dram=${DSV41_KV_DRAM_GB}GB/rank meta=127.0.0.1:$DSV41_KV_META_PORT config=$MMC_LOCAL_CONFIG_PATH"
 else
   echo "[serve] kv_pool=off (DSV41_KV_POOL=0)"
 fi

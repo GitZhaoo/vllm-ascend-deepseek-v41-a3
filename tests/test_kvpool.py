@@ -1,14 +1,16 @@
-"""Tests for the optional Mooncake KV pool (AscendStoreConnector) wiring.
+"""Tests for the optional external KV pool (AscendStoreConnector + MemCache).
 
-The pool is enabled by default (DSV41_KV_POOL=1): serve.sh asks
-scripts/kvpool.sh to write mooncake.json, starts mooncake_master if needed and
-passes --kv-transfer-config to vLLM. These tests stay hermetic — they only
-exercise config rendering and the static wiring, never a live master.
+This mirrors the reference deployment CJYLZS/vllm-ascend-deepseek-v41-a2:
+serve.sh asks scripts/kvpool.sh to render mmc-local.conf/mmc-meta.conf, starts
+(or reuses) a CPU-only memcache_hybrid MetaService, then passes
+--kv-transfer-config with backend=memcache and MMC_LOCAL_CONFIG_PATH.
+
+The tests are hermetic: they exercise config rendering, the 0101 correctness
+gate and static wiring, but never start a live MetaService.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import tempfile
@@ -19,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 KVPOOL = ROOT / "scripts" / "kvpool.sh"
 SERVE = ROOT / "scripts" / "serve.sh"
 COMMON = ROOT / "scripts" / "common.sh"
+DOC = ROOT / "docs" / "kv-pool.md"
 
 
 def run_kvpool(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -40,87 +43,100 @@ def run_kvpool(*args: str, env: dict[str, str] | None = None) -> subprocess.Comp
     )
 
 
+def parse_conf(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
 class RenderConfigTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name) / "kvpool"
 
-    def config(self, **extra: str) -> dict:
+    def config(self, **extra: str) -> tuple[dict[str, str], dict[str, str]]:
         env = {"DSV41_KVPOOL_STATE_DIR": str(self.state), **extra}
         result = run_kvpool("render-config", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         path = Path(result.stdout.strip())
         self.assertTrue(path.is_file())
-        return json.loads(path.read_text())
+        self.assertEqual(path, self.state / "mmc-local.conf")
+        return parse_conf(path), parse_conf(self.state / "mmc-meta.conf")
 
     def test_defaults_match_reference_deployment(self) -> None:
-        cfg = self.config()
-        self.assertEqual(cfg["metadata_server"], "P2PHANDSHAKE")
-        self.assertEqual(cfg["protocol"], "ascend")
-        self.assertEqual(cfg["device_name"], "")
-        self.assertEqual(cfg["master_server_address"], "127.0.0.1:50088")
-        self.assertEqual(cfg["global_segment_size"], "32GB")
-        self.assertEqual(cfg["tenant_id"], "default")
-        self.assertFalse(cfg["enable_ssd_offload"])
-        self.assertTrue(cfg["prefer_alloc_in_same_node"])
-        # A3: writes must stay in the writer's own segment (no cross-NPU P2P).
-        self.assertTrue(cfg["preferred_segment"])
-
-    def test_preferred_segment_can_be_disabled(self) -> None:
-        cfg = self.config(DSV41_MOONCAKE_PREFERRED_SEGMENT="0")
-        self.assertFalse(cfg["preferred_segment"])
+        local, meta = self.config()
+        self.assertEqual(local["ock.mmc.meta_service_url"], "tcp://127.0.0.1:5100")
+        self.assertEqual(local["ock.mmc.local_service.config_store_url"], "tcp://127.0.0.1:6100")
+        self.assertEqual(local["ock.mmc.local_service.world_size"], "256")
+        self.assertEqual(local["ock.mmc.local_service.protocol"], "host_shm")
+        self.assertEqual(local["ock.mmc.local_service.dram.size"], "2GB")
+        self.assertEqual(meta["ock.mmc.meta_service.metrics_url"], "http://127.0.0.1:8100")
+        self.assertEqual(meta["ock.mmc.meta_service_url"], "tcp://127.0.0.1:5100")
 
     def test_overrides_are_honoured(self) -> None:
-        cfg = self.config(
-            DSV41_MOONCAKE_MASTER="10.0.0.5:50089",
-            DSV41_MOONCAKE_SEGMENT_SIZE="16GB",
-            DSV41_MOONCAKE_TENANT="team-a",
+        local, meta = self.config(
+            DSV41_KV_DRAM_GB="8",
+            DSV41_KV_META_PORT="15100",
+            DSV41_KV_STORE_PORT="16100",
+            DSV41_KV_METRICS_PORT="18100",
+            DSV41_KV_WORLD_SIZE="32",
         )
-        self.assertEqual(cfg["master_server_address"], "10.0.0.5:50089")
-        self.assertEqual(cfg["global_segment_size"], "16GB")
-        self.assertEqual(cfg["tenant_id"], "team-a")
+        self.assertEqual(local["ock.mmc.local_service.dram.size"], "8GB")
+        self.assertEqual(local["ock.mmc.local_service.world_size"], "32")
+        self.assertEqual(local["ock.mmc.meta_service_url"], "tcp://127.0.0.1:15100")
+        self.assertEqual(meta["ock.mmc.meta_service_url"], "tcp://127.0.0.1:15100")
+        self.assertEqual(meta["ock.mmc.meta_service.metrics_url"], "http://127.0.0.1:18100")
 
-    def test_ssd_offload_requires_path(self) -> None:
+    def test_invalid_dram_is_rejected(self) -> None:
+        result = run_kvpool(
+            "render-config",
+            env={"DSV41_KVPOOL_STATE_DIR": str(self.state), "DSV41_KV_DRAM_GB": "lots"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DSV41_KV_DRAM_GB", result.stderr)
+
+    def test_unknown_protocol_is_rejected(self) -> None:
+        result = run_kvpool(
+            "render-config",
+            env={"DSV41_KVPOOL_STATE_DIR": str(self.state), "DSV41_KV_PROTOCOL": "tcp"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DSV41_KV_PROTOCOL", result.stderr)
+
+    def test_port_collision_with_vllm_is_rejected(self) -> None:
         result = run_kvpool(
             "render-config",
             env={
                 "DSV41_KVPOOL_STATE_DIR": str(self.state),
-                "DSV41_MOONCAKE_SSD_OFFLOAD": "1",
+                "DSV41_PORT": "8100",
+                "DSV41_KV_METRICS_PORT": "8100",
             },
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("DSV41_MOONCAKE_SSD_PATH", result.stderr)
-
-    def test_ssd_offload_path_is_rendered(self) -> None:
-        cfg = self.config(
-            DSV41_MOONCAKE_SSD_OFFLOAD="1",
-            DSV41_MOONCAKE_SSD_PATH="/nvme/mooncake_offload",
-        )
-        self.assertTrue(cfg["enable_ssd_offload"])
-        self.assertEqual(cfg["ssd_offload_path"], "/nvme/mooncake_offload")
+        self.assertIn("与 vLLM --port 相同", result.stderr)
 
     def test_print_env_reports_effective_values(self) -> None:
         result = run_kvpool(
             "print-env",
             env={
                 "DSV41_KVPOOL_STATE_DIR": str(self.state),
-                "DSV41_MOONCAKE_SEGMENT_SIZE": "16GB",
+                "DSV41_KV_DRAM_GB": "8",
             },
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("DSV41_KV_POOL=1", result.stdout)
-        self.assertIn("DSV41_MOONCAKE_SEGMENT_SIZE=16GB", result.stdout)
-        self.assertIn("DSV41_KVPOOL_MAX_MEM_PCT=40", result.stdout)
+        self.assertIn("DSV41_KV_POOL=0", result.stdout)
+        self.assertIn("DSV41_KV_DRAM_GB=8", result.stdout)
+        self.assertIn("DSV41_KV_PROTOCOL=host_shm", result.stdout)
+        self.assertIn("DSV41_KVPOOL_MAX_MEM_PCT=25", result.stdout)
+
 
 
 class CapacityTest(unittest.TestCase):
-    """The preflight must catch an over-committed pool before the engine loads.
-
-    A 64GB/卡 × 16 dies pool passes HcommMemReg in isolation but failed on the
-    real node once the engine's own host footprint was counted, so the budget
-    is checked against MemTotal/MemAvailable up front.
-    """
+    """The preflight catches an over-committed pool before the engine loads."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -146,60 +162,95 @@ class CapacityTest(unittest.TestCase):
     def test_default_passes_on_this_node_class(self) -> None:
         result = self.check(self.meminfo_with(2010, 1900))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("512 GiB", result.stderr)
+        self.assertIn("32.0 GiB", result.stderr)
 
     def test_one_tib_pool_is_rejected(self) -> None:
-        result = self.check(self.meminfo_with(2010, 1900), DSV41_MOONCAKE_SEGMENT_SIZE="64GB")
+        result = self.check(self.meminfo_with(2010, 1900), DSV41_KV_DRAM_GB="64")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("1024 GiB", result.stderr)
-        self.assertIn("DSV41_MOONCAKE_SEGMENT_SIZE", result.stderr)
+        self.assertIn("1024.0 GiB", result.stderr)
+        self.assertIn("DSV41_KV_DRAM_GB", result.stderr)
 
     def test_small_node_gets_a_smaller_suggestion(self) -> None:
-        result = self.check(self.meminfo_with(1024, 1000))
+        result = self.check(self.meminfo_with(1024, 1000), DSV41_KV_DRAM_GB="32")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("降到", result.stderr)
-        # 40% of 1 TiB / 16 ranks = 25 GiB → rounded down to a multiple of 4.
-        self.assertIn("24GB", result.stderr)
+        # 25% of 1 TiB / 16 ranks = 16 GiB.
+        self.assertIn("16GB", result.stderr)
 
     def test_invalid_size_is_rejected(self) -> None:
-        result = self.check(self.meminfo_with(2010, 1900), DSV41_MOONCAKE_SEGMENT_SIZE="lots")
+        result = self.check(self.meminfo_with(2010, 1900), DSV41_KV_DRAM_GB="lots")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("DSV41_MOONCAKE_SEGMENT_SIZE", result.stderr)
+        self.assertIn("DSV41_KV_DRAM_GB", result.stderr)
 
-    def test_ensure_fails_before_touching_the_master(self) -> None:
+    def test_ensure_fails_before_touching_meta(self) -> None:
         result = run_kvpool(
             "ensure",
             env={
+                "DSV41_KV_POOL": "1",
                 "DSV41_KVPOOL_STATE_DIR": str(self.state),
+                "DSV41_KV_META_LOG": str(Path(self.tmp.name) / "meta.log"),
+                "DSV41_KV_META_PID_FILE": str(Path(self.tmp.name) / "meta.pid"),
                 "DSV41_MEMINFO_FILE": self.meminfo_with(2010, 1900),
-                "DSV41_MOONCAKE_SEGMENT_SIZE": "64GB",
+                "DSV41_KV_DRAM_GB": "64",
             },
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("容量预检未通过", result.stderr)
-        self.assertFalse((self.state / "mooncake.json").exists())
+        self.assertIn("容量校验失败", result.stderr)
+        self.assertFalse((self.state / "mmc-local.conf").exists())
+        self.assertFalse((Path(self.tmp.name) / "meta.pid").exists())
+
+
+class TreeFixTest(unittest.TestCase):
+    def test_missing_0101_refuses_to_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_kvpool(
+                "start",
+                env={
+                    "DSV41_KV_POOL": "1",
+                    "DSV41_ROOTFS": tmp,
+                    "DSV41_KV_META_LOG": str(Path(tmp) / "meta.log"),
+                    "DSV41_KV_META_PID_FILE": str(Path(tmp) / "meta.pid"),
+                },
+            )
+        self.assertEqual(result.returncode, 8, result.stderr)
+        self.assertIn("0101", result.stderr)
+        self.assertIn("MRV2", result.stderr)
+
+    def test_allow_unfixed_tree_is_an_explicit_escape_hatch(self) -> None:
+        text = KVPOOL.read_text()
+        self.assertIn("DSV41_KV_ALLOW_UNFIXED_TREE", text)
+        self.assertIn("_preempted_req_ids.discard(request.req_id)", text)
 
 
 class WiringTest(unittest.TestCase):
-    """Guard the default-on behaviour and the engine flag wiring."""
-
-    def test_default_is_enabled(self) -> None:
+    def test_default_is_opt_in(self) -> None:
         text = COMMON.read_text()
-        self.assertIn(': "${DSV41_KV_POOL:=1}"', text)
-        self.assertIn(': "${DSV41_MOONCAKE_SEGMENT_SIZE:=32GB}"', text)
+        self.assertIn(': "${DSV41_KV_POOL:=0}"', text)
+        self.assertIn(': "${DSV41_KV_DRAM_GB:=2}"', text)
+        self.assertIn(': "${DSV41_KV_PROTOCOL:=host_shm}"', text)
 
-    def test_serve_appends_kv_transfer_config(self) -> None:
+    def test_serve_uses_memcache_not_mooncake(self) -> None:
         text = SERVE.read_text()
         self.assertIn("AscendStoreConnector", text)
+        self.assertIn('"backend":"memcache"', text)
+        self.assertIn("MMC_LOCAL_CONFIG_PATH", text)
         self.assertIn('ARGS+=(--kv-transfer-config "$KVPOOL_JSON")', text)
-        self.assertIn('export PYTHONHASHSEED="$DSV41_PYTHONHASHSEED"', text)
-        self.assertIn("MOONCAKE_CONFIG_PATH", text)
-        self.assertIn("ASCEND_TRANSFER_TIMEOUT", text)
-        self.assertIn("ASCEND_CONNECT_TIMEOUT", text)
+        # Regression: the old Mooncake/HIXL wiring must not come back.
+        self.assertNotIn("MOONCAKE_CONFIG_PATH", text)
+        self.assertNotIn("ASCEND_TRANSFER_TIMEOUT", text)
+        self.assertNotIn("PYTHONHASHSEED", text)
 
-    def test_rollback_switch_documented(self) -> None:
+    def test_rollback_switch_is_documented(self) -> None:
         text = COMMON.read_text()
-        self.assertIn("DSV41_KV_POOL=0", text)
+        self.assertIn(': "${DSV41_KV_POOL:=0}"', text)
+
+    def test_docs_describe_the_reference_design(self) -> None:
+        text = DOC.read_text()
+        self.assertIn("AscendStoreConnector", text)
+        self.assertIn("MemCache", text)
+        self.assertIn("host_shm", text)
+        self.assertIn("0101", text)
+        self.assertNotIn("Mooncake", text)
 
 
 if __name__ == "__main__":

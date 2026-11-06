@@ -3,6 +3,47 @@
 All notable changes to this deployment project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] — 2026-11-05
+
+### Added
+
+- **vllm 侧补丁**：`scripts/patches/vllm-ced6857af/`，修复 DeepSeek-V4.1
+  用户/工具文本中的控制 token 逃逸（防伪造轮次边界），以及只挂 tools 的空
+  developer 消息触发 HTTP 500。`apply_patches.sh` 现在同时管理 vllm-ascend
+  与 vllm 两个源码树。
+- **0101 KV 池 MRV2 抢占修复**：外部池启用时，避免抢占恢复把错误 block
+  关联到池 key（静默算错）。已并入 vllm-ascend 补丁序列，`verify` 会检查。
+- **补丁内容指纹**：每个 marker 记录补丁 SHA-256，并写
+  `series.fingerprint`（series.conf + 补丁 + 目标 HEAD）。补丁改了但树里还是
+  旧版本时，`status`/`apply` 会报 `[补丁已变更]` 并要求 `revert --force`，
+  不再只凭 marker 判断“已应用”。
+- **定向回归测试**：`tests/ut/ops/triton/test_packed_cache_slot_mapping.py`
+  （0005 的 33 个等价性用例）、`tests/ut/distributed/ascend_store/
+  test_mrv2_preempt_marker.py`（0101）、`tests/ut/vllm/
+  test_encoding_safety.py`（vllm 侧）。`make test-patches` 运行。
+- **运行期自证**：`doctor.sh` 检查 plog 中 `aivMode[1]` 的 rank 数、serve 日志中
+  V2 model runner 的 rank 数，并提示 `HCCL_DETERMINISTIC` 会压掉 AIV。
+
+### Fixed
+
+- **外部 KV 池改回参考部署的 MemCache/host_shm 实现**：此前误恢复了
+  Mooncake master 方案，在本机 A3 上会触发跨卡 HIXL
+  （`halDeviceDisableP2P ret:17`）。现按 `vllm-ascend-deepseek-v41-a2` 的
+  `kv_offload.sh` 重写：
+  - `AscendStoreConnector` + `backend=memcache`；
+  - CPU-only `memcache_hybrid` MetaService（:5100/:6100/:8100）；
+  - `host_shm`，默认 `2GB/rank × 16 = 32 GiB`；
+  - `MMC_LOCAL_CONFIG_PATH` + 两个 `mmc-*.conf`；
+  - 0101 缺失时拒绝启动；
+  - 不再设置 `MOONCAKE_*`、`ASCEND_*_TIMEOUT`、`PYTHONHASHSEED`。
+
+### Changed
+
+- `docs/patches.md`、`docs/kv-pool.md`、`README.md` 同步 5+1 补丁、内容指纹、
+  0101 与回归测试。
+- 外部 KV 池默认改为 opt-in（`DSV41_KV_POOL=0`），与参考部署的
+  `KV_OFFLOAD=0` 一致；本机 `config/dsv41.local.env` 保持关闭，验证后再打开。
+
 ## [0.2.1] — 2026-11-05
 
 ### Fixed
