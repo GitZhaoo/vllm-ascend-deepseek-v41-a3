@@ -49,6 +49,7 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${DSV41_TOOL_CALL_PARSER:=deepseek_v41}"
 : "${DSV41_CUDAGRAPH_SIZES:=1,2,4,6,8,12,16,18,24,30,32,40,48,54,56,64,72,78,80,88,96,102,104,112,120,126,128,136,144,150,152,160,168,174,176,184,192}"
 : "${DSV41_EXTRA_SERVE_ARGS:=}"
+: "${DSV41_ENGRAM_DP_SHARED:=true}"
 
 : "${DSV41_LB_MODE:=internal}"                 # internal | external
 : "${DSV41_DP_BASE_PORT:=$((DSV41_PORT + 1))}"  # rank0 port (external mode)
@@ -320,7 +321,7 @@ SPEC_JSON=$(printf '{"num_speculative_tokens":%s,"method":"dspark","enforce_eage
 COMP_JSON=$(printf '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[%s]}' "$DSV41_CUDAGRAPH_SIZES")
 LOADER_JSON=$(printf '{"enable_multithread_load":true,"num_threads":%s}' "$DSV41_LOADER_THREADS")
 ADDITIONAL_JSON='{"enable_cpu_binding":true,"ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false},"multistream_overlap_shared_expert":true}'
-ENGRAM_JSON='{"cpu_offload":true,"dp_shared_memory":true}'
+ENGRAM_JSON=$(printf '{"cpu_offload":true,"dp_shared_memory":%s}' "$DSV41_ENGRAM_DP_SHARED")
 
 ARGS=(
   serve "$DSV41_MODEL"
