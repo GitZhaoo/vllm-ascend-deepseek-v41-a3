@@ -264,6 +264,12 @@ export VLLM_ASCEND_V41_MOE_MASK_RANGE="${VLLM_ASCEND_V41_MOE_MASK_RANGE:-1}"
 export VLLM_ASCEND_V41_O_PROJ_2D="${VLLM_ASCEND_V41_O_PROJ_2D:-1}"
 export VLLM_ASCEND_V41_QLI_NO_CANDIDATE="${VLLM_ASCEND_V41_QLI_NO_CANDIDATE:-1}"
 export VLLM_ASCEND_V41_ENGRAM_WKV_TP="${VLLM_ASCEND_V41_ENGRAM_WKV_TP:-1}"
+# Optional per-stream core budget (A3 only; needs scripts/patches/experimental/
+# 0202-limit-core-num.patch applied). 0 = disabled (upstream behaviour).
+# Measured on 2026-11-12: MAIN=16/AUX=32 gave +3~6% single-stream decode.
+export VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV:-0}"
+export VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV:-0}"
+export VLLM_ASCEND_V41_LIMIT_CORE_AIC="${VLLM_ASCEND_V41_LIMIT_CORE_AIC:-0}"
 
 # ---- rootfs Python + CANN --------------------------------------------------
 export PYTHONHOME="$PYTHON_HOME_DIR"
