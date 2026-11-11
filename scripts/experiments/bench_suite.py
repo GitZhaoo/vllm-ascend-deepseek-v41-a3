@@ -145,7 +145,7 @@ def derive_step_metrics(before, after, requests):
     }
 
 
-async def sanity_flags(row, max_tokens):
+def sanity_flags(row, max_tokens):
     """Flag runs that look like a broken engine instead of a slow one."""
     flags = []
     if max_tokens >= 16 and row.get("tokens", 0) <= 2:
@@ -155,7 +155,7 @@ async def sanity_flags(row, max_tokens):
     return flags
 
 
-def single_stream(base_url, model, headers, prompt, max_tokens, repeats):
+async def single_stream(base_url, model, headers, prompt, max_tokens, repeats):
     url = base_url.rstrip("/") + "/v1/completions"
     async with aiohttp.ClientSession(headers=headers) as session:
         # warm-up (also fills prefix cache for the hot-prefix case)
