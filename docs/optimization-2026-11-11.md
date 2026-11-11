@@ -148,7 +148,7 @@ p90 13.5 ms / max 247 ms，是 TTFT 长尾来源之一；13 个 KV group 各自�
    `export VLLM_ENGINE_READY_TIMEOUT_S` 之前只 export 未赋值，等于从未生效；
    冷启动权重加载 >600 s 时引擎会以 `Timed out waiting for engine core processes to start` 失败
    （本轮在 new_rl 首次启动真实踩到）。现改为 `export VLLM_ENGINE_READY_TIMEOUT_S="$DSV41_ENGINE_READY_TIMEOUT_S"`。
-2. **可复现 A/B 工具链**（`extra-info/exp/`）：
+2. **可复现 A/B 工具链**（仓库 `scripts/experiments/`，本轮原始数据在 `extra-info/exp/`）：
    - `bench_suite.py`：单流/短prompt/冷前缀/双前缀并发 + `/metrics` 拆分（含 ms/step、接受率、引擎 prefill）；
    - `run_config.sh` + `envs/*.env`：一键起停 + 隔离 HOME/编译缓存 + 证据归档；
    - `patch_serve.py`：给测试副本注入 graph/MC2/kernel knob（不改生产脚本）；
