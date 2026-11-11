@@ -162,9 +162,20 @@ async def single_stream(base_url, model, headers, prompt, max_tokens, repeats):
         await one_request(session, url, payload_for(model, prompt, 16))
         await asyncio.sleep(1.0)
         rows = []
+        transient = 0
         for _ in range(repeats):
             before = snapshot(base_url)
             r = await one_request(session, url, payload_for(model, prompt, max_tokens))
+            # The engine occasionally emits EOS as the very first token on a hot
+            # prefix (non-deterministic under MoE + spec decode). Retry instead of
+            # poisoning the median with a 1-token run.
+            tries = 0
+            while max_tokens >= 16 and "error" not in r and r.get("tokens", 0) <= 2 and tries < 3:
+                transient += 1
+                tries += 1
+                await asyncio.sleep(0.5)
+                before = snapshot(base_url)
+                r = await one_request(session, url, payload_for(model, prompt, max_tokens))
             after = snapshot(base_url)
             if "error" in r:
                 rows.append(r)
@@ -189,6 +200,7 @@ async def single_stream(base_url, model, headers, prompt, max_tokens, repeats):
         "tokens": statistics.median(r["tokens"] for r in ok),
         "engine_prefill_ms": statistics.median([r["engine_prefill_ms"] for r in ok if r.get("engine_prefill_ms")]),
         "engine_ttft_ms": statistics.median([r["engine_ttft_ms"] for r in ok if r.get("engine_ttft_ms")]),
+        "transient_eos_retries": transient,
     }
 
 
