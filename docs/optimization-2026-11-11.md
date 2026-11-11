@@ -95,6 +95,18 @@ piecewise 捕获桶按 decode 桶（≤192 token）推导，794 token 的 prefil
 | 4 | `enable_prefill_mc2=1`（BAT 16384） | **启动失败** | worker init 崩溃（MC2 buffer 按 max-num-batched-tokens 分配，1M 上下文 + 16384 批次下 HBM 不足） | ⚠ 需降 BAT 重试（未完成） |
 | 5 | `max_num_seqs=32→64` + 桶扩到 384（BAT 16384） | **启动失败** | 桶数 32→46，图显存 + 捕获时间暴涨，HBM 超预算 | ⚠ 需配 BAT 8192（本轮未跑通） |
 
+### 4.1 第二轮（15:15–15:45）未能产出数据：测试节点进入不可恢复的启动异常
+
+计划中的 4 个配置（baseline 复测 / KV 池开 / max_num_seqs=64+BAT8192 / prefill_mc2+BAT8192）
+在新的 rootfs 副本上全部卡在启动阶段，错误从
+`ERR00100 PTA call acl api failed`（`aclrtBinaryLoadFromData` 解析算子二进制失败，
+但**同一算子二进制在源节点与测试节点 md5 完全一致**，说明不是文件损坏）
+到 `/health` 长期 503。结合当天累计 ~20 次引擎重启，判断为**节点级 HCCL/device 上下文异常**
+（见 §7.5），需要重建 Pod 才能恢复。为不影响节点环境，已停止实验并清理。
+
+⇒ 剩余三个变量（KV 池开/关、max_seqs64+BAT8192、prefill_mc2+BAT8192）的状态是
+**"已验证可配置、尚未实测"**，下一个窗口应在干净节点上按 §9 的顺序一次跑完。
+
 结论：**在本镜像上，"只改 flag" 这条路已经被堵死**（与参考仓库 repo1 的
 「不做 kernel/patch 开发单流 −12% 不可达」一致）。剩下的确定收益来自结构性开关与源码级工作。
 
@@ -130,7 +142,7 @@ p90 13.5 ms / max 247 ms，是 TTFT 长尾来源之一；13 个 KV group 各自�
 
 | 优先级 | 改动 | 预期收益 | 成本/风险 | 依据 |
 |---|---|---|---|---|
-| P0 | **PGO 版 libpython**（替换 rootfs 内 CPython，服务侧实测 −4.4% ms/step） | −4~5% ms → 单流 ~107 tok/s | 中：需在目标机 build（ref 仓库有 `build_scripts/00_ensure_pgo.sh`，我们可在 new_rl 上构建并只替换 rootfs 副本） | repo1 `EXPECTED_PERF.md:1.1`（31.63→30.23 ms，同会话 A/B） |
+| P0 | **PGO 版 libpython**（替换 rootfs 内 CPython，服务侧实测 −4.4% ms/step） | −4~5% ms → 单流 ~107 tok/s | **本轮已完成构建与兼容性验证**：`extra-info/pgo/libpython3.12.so.1.0`（28 MB，CPython 3.12.13 `--enable-shared --enable-optimizations`，与原 rootfs 同配置），已在 rootfs 副本上做过 swap + import 验证（`PY_OK 3.12.13`）；构建脚本 `scripts/experiments/build_pgo_python.sh`，swap 由 `run_config.sh` 的 `EXP_PGO_SWAP=1` 自动完成并回滚。**只差一次实测** | repo1 `EXPECTED_PERF.md:1.1`（31.63→30.23 ms，同会话 A/B） |
 | P1 | **层内控核 / limit_core_num**：把 `dsa_v41.py` 里 `wait_event` 串行改成官方 12+8 控核并行 | +4~9% 单流 | 中：需写 patch（数十行），零精度风险 | repo1 `docs/SINGLE-STREAM-LEVERS-EXHAUSTED` 剩余三类之一 |
 | P1 | **通信-计算重叠**：91 次 allreduce/step 目前 100% 暴露（comm∩AIC=0），用双流分支图捕获重叠 | +5~12% 单流 | 高：需 patch + 精度回归（长 prompt token 一致性） | repo1 §A2GAP / 上游 #11273 |
 | P2 | **KV 池 lookup 精简**：本地前缀已覆盖 94% 时跳过同步 ZMQ RPC；13 个 KV group 的 `exists` 合并成 1 次 | TTFT −5~15 ms、p95 明显改善 | 低：两处小 patch | code-scout `code-opportunities.md` B3（含 file:line） |
@@ -166,6 +178,8 @@ p90 13.5 ms / max 247 ms，是 TTFT 长尾来源之一；13 个 KV group 各自�
 |---|---|---|
 | 端口/通信初始化失败 | `EI0019 Communication_Error_Bind_IP_Port` | 上一轮 worker 未完全退出就重启 |
 | HCCL ranktable 收集失败 | `EI0015 Communication_Error_Ranktable_Detect` / `hcclCommInitRootInfoConfig` 失败 | 连续重启 ~10–15 次后，**任何配置**都起不来（含原本能起的 baseline） |
+| 算子二进制装载失败 | `ERR00100 ... aclrtBinaryLoadFromData failed / EE1014 Failed to parse the binary file of the operator`（同一算子文件在源/测试节点 md5 一致） | 同上，属设备侧上下文异常而非文件损坏 |
+| 启动卡住 | `/health` 长期 503，serve 日志无 ERROR | 同上 |
 
 处置经验（本轮验证有效）：
 1. 停服后**等 NPU 显存回落到 ~3.2 GB/die 基线**再启动（`npu-smi info` 观察），
@@ -174,6 +188,31 @@ p90 13.5 ms / max 247 ms，是 TTFT 长尾来源之一；13 个 KV group 各自�
    仍失败则需要节点级恢复（重启 Pod / 释放 HCCL 资源）。本轮最终因此停止了剩余 A/B。
 3. 生产 `watchdog.sh` 的自动重启应加入同样的前置等待（否则故障恢复可能反而打不进 HCCL）。
    这是本轮建议单独提的一个运维改进点。
+
+---
+
+## 9. 下一个窗口的执行顺序（可直接照做）
+
+前提：一个**干净**的测试节点（新建 Pod、/cache 为空），线上 rootfs 副本 + 本仓库副本。
+
+```bash
+# 0) 环境（约 8 分钟）：stage rootfs -> extract -> repo copy -> knob patch
+#    见 §1 与 scripts/experiments/README.md
+# 1) 干净基线（带引擎 prefill 拆分）
+bash scripts/experiments/run_config.sh exp0b_baseline scripts/experiments/envs/exp0b_baseline.env
+# 2) KV 池开/关同节点 A/B（本轮未完成，线上是开着的）
+bash scripts/experiments/run_config.sh exp13_kvpool_on scripts/experiments/envs/exp13_kvpool_on.env
+# 3) 并发杠杆：max_num_seqs=64 + BAT 8192（repo1 实测 +32~37%）
+bash scripts/experiments/run_config.sh exp14_maxseqs64_bat8192 scripts/experiments/envs/exp14_maxseqs64_bat8192.env
+# 4) TTFT 杠杆：prefill MC2 @ BAT 8192
+bash scripts/experiments/run_config.sh exp15_prefill_mc2_bat8192 scripts/experiments/envs/exp15_prefill_mc2_bat8192.env
+# 5) PGO libpython（产物已就绪）
+bash scripts/experiments/build_pgo_python.sh /cache/pgo-src.tgz /cache/pgo   # 若需重建
+bash scripts/experiments/run_config.sh exp16_pgo scripts/experiments/envs/exp16_pgo.env
+```
+
+每组约 10–12 分钟（权重加载 ~3 分钟 + 图捕获 ~1.5 分钟 + 压测 ~3 分钟）。
+每组结束自动归档 JSON / 证据 / `/metrics` 快照到 `$EXP/json|logs`。
 
 ---
 

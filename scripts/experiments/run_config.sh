@@ -77,6 +77,21 @@ for _ in $(seq 1 30); do
 done
 sleep 5
 
+# --- optional PGO libpython swap (exp16) --------------------------------------
+PGO_LIB_DIR=/cache/pgo/py312/lib
+PY_ROOT=$DSV41_ROOTFS/usr/local/python3.12.13
+if [ "${EXP_PGO_SWAP:-0}" = "1" ] && [ -f "$PGO_LIB_DIR/libpython3.12.so.1.0" ]; then
+  [ -f "$PY_ROOT/lib/libpython3.12.so.1.0.orig" ] || \
+    cp "$PY_ROOT/lib/libpython3.12.so.1.0" "$PY_ROOT/lib/libpython3.12.so.1.0.orig"
+  cp "$PGO_LIB_DIR/libpython3.12.so.1.0" "$PY_ROOT/lib/libpython3.12.so.1.0"
+  echo "--- PGO libpython swapped in"
+  restore_pgo() {
+    [ -f "$PY_ROOT/lib/libpython3.12.so.1.0.orig" ] && \
+      cp "$PY_ROOT/lib/libpython3.12.so.1.0.orig" "$PY_ROOT/lib/libpython3.12.so.1.0"
+  }
+  trap restore_pgo EXIT
+fi
+
 # --- start -------------------------------------------------------------------
 START_TS=$(date +%s)
 bash "$REPO/scripts/serve.sh" > "$EXP/logs/$CFG.launcher.log" 2>&1
@@ -135,7 +150,7 @@ sleep 3
 export PYTHONHOME=$ROOTFS/usr/local/python3.12.13
 export PYTHONPATH="$ROOTFS/usr/local/python3.12.13/lib/python3.12/site-packages"
 export PATH=$ROOTFS/usr/local/python3.12.13/bin:$PATH
-"$PY" "$REPO/extra-info/exp/bench_suite.py" \
+"$PY" "$REPO/scripts/experiments/bench_suite.py" \
   --base-url "http://127.0.0.1:$DSV41_PORT" \
   --model DeepSeek-V4.1-Flash-1017 \
   --api-key "$DSV41_API_KEY" \
