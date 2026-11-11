@@ -229,7 +229,10 @@ fi
 # ---- process environment ---------------------------------------------------
 unset NPU_VISIBLE_DEVICES ASCEND_VISIBLE_DEVICES 2>/dev/null || true
 
-export VLLM_ENGINE_READY_TIMEOUT_S
+# Map our tunable onto vLLM's knob. Plain `export VAR` only exports an already
+# set variable, so a cold start (slow NFS weight load > 600 s default) used to
+# die with "Timed out waiting for engine core processes to start".
+export VLLM_ENGINE_READY_TIMEOUT_S="$DSV41_ENGINE_READY_TIMEOUT_S"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HCCL_BUFFSIZE
 export HCCL_OP_EXPANSION_MODE="$DSV41_HCCL_OP_EXPANSION_MODE"
