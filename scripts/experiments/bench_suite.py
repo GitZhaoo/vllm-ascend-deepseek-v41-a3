@@ -145,7 +145,17 @@ def derive_step_metrics(before, after, requests):
     }
 
 
-async def single_stream(base_url, model, headers, prompt, max_tokens, repeats):
+async def sanity_flags(row, max_tokens):
+    """Flag runs that look like a broken engine instead of a slow one."""
+    flags = []
+    if max_tokens >= 16 and row.get("tokens", 0) <= 2:
+        flags.append("only_1_token_generated")
+    if row.get("ttft_ms") == 0:
+        flags.append("no_first_token_chunk")
+    return flags
+
+
+def single_stream(base_url, model, headers, prompt, max_tokens, repeats):
     url = base_url.rstrip("/") + "/v1/completions"
     async with aiohttp.ClientSession(headers=headers) as session:
         # warm-up (also fills prefix cache for the hot-prefix case)
@@ -160,7 +170,11 @@ async def single_stream(base_url, model, headers, prompt, max_tokens, repeats):
                 rows.append(r)
                 continue
             step = derive_step_metrics(before, after, [r])
-            rows.append({**r, **step})
+            flags = sanity_flags({**r, **step}, max_tokens)
+            if flags:
+                print(f"  !! suspicious run: {flags} tokens={r.get('tokens')} "
+                      f"ttft={r.get('ttft'):.3f}", flush=True)
+            rows.append({**r, **step, "flags": flags})
             await asyncio.sleep(1.0)
     ok = [r for r in rows if "error" not in r]
     if not ok:
