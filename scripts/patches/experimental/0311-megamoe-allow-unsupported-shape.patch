@@ -1,0 +1,26 @@
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index c49b4f8..f960471 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -1050,6 +1050,21 @@ class AscendConfig:
+ 
+     @staticmethod
+     def _is_megamoe_supported_by_config(vllm_config: VllmConfig) -> bool:
++        # --- experimental shape-gate bypass (env-gated, default off) ---------
++        # DeepSeek-V4.1-Flash has moe_intermediate_size=2304 (intermediate_hidden
++        # 4608), which the stock A3 whitelist rejects because
++        # moe_intermediate_size % 512 != 0.  The rejection is silent and rolls
++        # enable_fused_mc2=2 back to 0, so MegaMoe never runs.  Set this env only
++        # to probe whether the installed CANN MegaMoe op can tile this shape.
++        if os.environ.get("VLLM_ASCEND_V41_MEGAMOE_ALLOW_UNSUPPORTED_SHAPE", "0") == "1":
++            logger.warning_once(
++                "MegaMoe shape gate bypassed by "
++                "VLLM_ASCEND_V41_MEGAMOE_ALLOW_UNSUPPORTED_SHAPE=1; the operator may reject "
++                "hidden_size=%s / moe_intermediate_size=%s at tiling time.",
++                getattr(vllm_config.model_config.hf_text_config, "hidden_size", None),
++                getattr(vllm_config.model_config.hf_text_config, "moe_intermediate_size", None),
++            )
++            return True
+         if get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP):
+             mega_moe_supported_by_config = AscendConfig._is_a5_megamoe_supported_by_config(vllm_config)
+             logger.debug("mega moe operator is supported by current a5 config: %r", mega_moe_supported_by_config)

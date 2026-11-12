@@ -1,0 +1,34 @@
+diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
+index 3d625f4..1b08c61 100644
+--- a/vllm_ascend/attention/dsa_v41.py
++++ b/vllm_ascend/attention/dsa_v41.py
+@@ -79,6 +79,17 @@ from vllm_ascend.worker.device_metadata import (
+ 
+ V41_METADATA_BUFFER_SIZE = 1024
+ 
++# --- optional padded-buffer zero-fill elimination (env-gated, default off) --
++# ``_project_output`` pads the attention result up to the graph-bucket token
++# count with ``new_zeros`` once per layer.  Only the real rows are consumed;
++# the filler rows are dropped by the runner, so an uninitialised ``new_empty``
++# padding yields identical outputs while removing one fill kernel per layer.
++_OPROJ_PAD_EMPTY = _os.environ.get("VLLM_ASCEND_V41_OPROJ_PAD_EMPTY", "0").strip().lower() in (
++    "1",
++    "true",
++    "yes",
++)
++
+ 
+ @eager_break_during_capture
+ def dsa_v41_forward(
+@@ -462,7 +473,10 @@ class AscendDSAV41Impl:
+     def _project_output(self, attn, output, hidden_states, metadata, *, projected):
+         padded = output
+         if output.shape[0] != hidden_states.shape[0]:
+-            padded = output.new_zeros((hidden_states.shape[0], output.shape[1], output.shape[2]))
++            if _OPROJ_PAD_EMPTY:
++                padded = output.new_empty((hidden_states.shape[0], output.shape[1], output.shape[2]))
++            else:
++                padded = output.new_zeros((hidden_states.shape[0], output.shape[1], output.shape[2]))
+             padded[: output.shape[0]] = output
+         attn.dsa_attn.dsa_attn.impl._forward_o_proj(padded, projected)
+         return projected

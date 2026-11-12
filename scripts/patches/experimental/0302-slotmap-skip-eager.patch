@@ -1,0 +1,48 @@
+diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
+index 3d625f4..8341db2 100644
+--- a/vllm_ascend/attention/dsa_v41.py
++++ b/vllm_ascend/attention/dsa_v41.py
+@@ -220,6 +220,19 @@ class DeepseekV41PreparedIndexer:
+     quantize_done: Any = None
+ 
+ 
++# --- optional slot-mapping eager-chain elimination (env-gated, default off) --
++# ``build`` runs once per KV cache group per step, so every eager op in the
++# slot-mapping preparation is paid ~13-25x per step.  When the single-launch
++# Triton kernel below is selected it consumes the *raw* slot mapping (the kernel
++# applies the compression rule itself), which makes the eager
++# ``compressed_slot_mapping`` chain dead work.
++_SLOTMAP_SKIP_EAGER = _os.environ.get("VLLM_ASCEND_V41_SLOTMAP_SKIP_EAGER", "0").strip().lower() in (
++    "1",
++    "true",
++    "yes",
++)
++
++
+ def compressed_slot_mapping(slot_mapping: torch.Tensor, ratio: int) -> torch.Tensor:
+     """Convert original-token physical slots to completed compressed slots.
+ 
+@@ -1088,17 +1101,18 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+                 # sharing is the finished mapping, and its key carries the
+                 # step size in the key above.
+                 raw_slots = common.slot_mapping[:num_input_tokens]
+-                active_slots = raw_slots
+-                if compressed and ratio != 1:
+-                    active_slots = compressed_slot_mapping(active_slots, ratio)
+-                if (
++                use_triton_slots = (
+                     self._triton_slot_mapping
+                     and raw_slots.device.type == "npu"
+                     # The kernel dereferences ``positions`` for ratio 2, while
+                     # the eager chain only applies the parity mask when
+                     # positions is present. Keep the eager path for that case.
+                     and (positions is not None or not (compressed and ratio == 2))
+-                ):
++                )
++                active_slots = raw_slots
++                if compressed and ratio != 1 and not (_SLOTMAP_SKIP_EAGER and use_triton_slots):
++                    active_slots = compressed_slot_mapping(active_slots, ratio)
++                if use_triton_slots:
+                     # One launch instead of the eager ~100-op chain. The kernel
+                     # applies the compression-ratio rule itself, so it must see
+                     # the *raw* slot mapping: pre-compressing would apply

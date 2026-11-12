@@ -1,0 +1,43 @@
+diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
+index 3d625f4..63f57d8 100644
+--- a/vllm_ascend/attention/dsa_v41.py
++++ b/vllm_ascend/attention/dsa_v41.py
+@@ -56,6 +56,13 @@ _LIMIT_CORE_MAIN_AIV = int(_os.environ.get("VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV"
+ _LIMIT_CORE_AUX_AIV = int(_os.environ.get("VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV", "0") or 0)
+ _LIMIT_CORE_AIC = int(_os.environ.get("VLLM_ASCEND_V41_LIMIT_CORE_AIC", "0") or 0)
+ 
++# --- optional q_norm + wq_b.quantize fusion (env-gated, default off) --------
++# ``npu_rms_norm_dynamic_quant`` produces (int8, per-token scale) in one kernel,
++# replacing the ``q_norm`` kernel plus the separate ``npu_dynamic_quant``.
++# Only valid where the bf16 ``qr`` has no other consumer, i.e. layers that are
++# not index sources (see ``_select_sparse_indices``).
++_QNORM_FUSE = _os.environ.get("VLLM_ASCEND_V41_QNORM_FUSE", "0").strip().lower() in ("1", "true", "yes")
++
+ 
+ @contextmanager
+ def _limit_core(aiv: int, stream=None):
+@@ -507,8 +514,22 @@ class AscendDSAV41Impl:
+             with _limit_core(_LIMIT_CORE_AUX_AIV, aux_stream):
+                 kv = wkv.matmul(kv_quant, kv_scale, bias=attn.wkv.bias)
+                 kv_matmul_done = aux_stream.record_event()
+-        qr = attn.q_norm(q_a)
+-        q_b_quant, q_b_scale = wq_b.quantize(qr)
++        if (
++            _QNORM_FUSE
++            and not self.role.is_index_source
++            and not wq_b._has_communication
++            and wq_b._is_w8a8_dynamic
++        ):
++            # Fused RMSNorm + dynamic quant writes the int8 activation and its
++            # per-token scale from one kernel instead of two.  ``qr`` is
++            # dropped because only index-source layers read the bf16 result.
++            q_b_quant, q_b_scale = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
++                q_a, attn.q_norm.weight, epsilon=v1_impl.eps
++            )
++            qr = None
++        else:
++            qr = attn.q_norm(q_a)
++            q_b_quant, q_b_scale = wq_b.quantize(qr)
+ 
+         # Part 3: Q_b matmul (Cube) overlaps KV norm and RoPE (Vector).
+         # A5 prefill/mixed cache publication follows the stream join below.

@@ -1,0 +1,42 @@
+diff --git a/vllm_ascend/ascend_forward_context.py b/vllm_ascend/ascend_forward_context.py
+index eee76d5..14dd37a 100644
+--- a/vllm_ascend/ascend_forward_context.py
++++ b/vllm_ascend/ascend_forward_context.py
+@@ -48,6 +48,14 @@ _MEGAMOE_PREFILL_MIN_TOKENS = int(
+ _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
+ _MC2_TOKENS_PER_RANK_LIMIT = 512
+ 
++# --- experimental MegaMoe draft exclusion (env-gated, default off) ----------
++# The DSpark/MTP draft is itself MoE (3 draft blocks, 128 routed experts) and
++# the A3 FUSED_OR_CAPACITY selector never consults is_draft_model, so the
++# drafter inherits FUSED_MC2/MegaMoe from the target model.  Draft forwards are
++# decode-sized and latency-critical; keep them on the regular MC2 path unless
++# explicitly asked to let the drafter use MegaMoe too.
++_MEGAMOE_EXCLUDE_DRAFT = os.environ.get("VLLM_ASCEND_V41_MEGAMOE_EXCLUDE_DRAFT", "0") == "1"
++
+ 
+ def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
+     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+@@ -429,6 +437,22 @@ def select_moe_comm_method(
+             is_draft_model,
+             draft_moe_quant_type,
+         )
++        if (
++            _MEGAMOE_EXCLUDE_DRAFT
++            and is_draft_model
++            and moe_comm_type is MoECommType.FUSED_MC2
++            and use_cann_megamoe(vllm_config)
++        ):
++            # Keep the drafter on the plain MC2/ALLTOALL path even when the
++            # target selected FUSED_MC2 (MegaMoe).  Draft MoE weights stay
++            # valid for MC2: the W8A8 MegaMoe preparation keeps
++            # layer.w13_weight / layer.w2_weight alive (only extra per-expert
++            # MegaMoe views are cached), so this downgrade is weight-safe.
++            moe_comm_type = (
++                MoECommType.MC2
++                if (num_tokens is None or num_tokens <= mc2_tokens_capacity)
++                else MoECommType.ALLTOALL
++            )
+     logger.debug(
+         "MoE comm method selected: policy=%s, method=%s, num_tokens=%d, mc2_capacity=%s, "
+         "is_draft_model=%s, draft_moe_quant_type=%r",
