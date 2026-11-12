@@ -1,0 +1,96 @@
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -1,5 +1,6 @@
+ import importlib
+ import math
++import os
+ import time
+ from collections.abc import Sequence
+ from typing import Any
+@@ -63,6 +64,15 @@
+ )
+ 
+ 
++# --- KV pool lookup fast-path gates (added 2026-11-12) -----------------------
++# Skip the synchronous ZMQ lookup when the local prefix cache already covers
++# everything except the final transfer-granularity block: any external hit would
++# be floored to zero matched tokens, so the RPC can only add latency.
++_KVPOOL_SKIP_LOCAL_LOOKUP = os.environ.get(
++    "VLLM_ASCEND_V41_KVPOOL_SKIP_LOCAL_LOOKUP", "1"
++).strip().lower() in ("1", "true", "yes")
++
++
+ class KVPoolScheduler:
+     def __init__(
+         self,
+@@ -687,6 +697,11 @@
+             else:
+                 if num_computed_tokens >= token_len:
+                     return 0, False
++                if (
++                    _KVPOOL_SKIP_LOCAL_LOOKUP
++                    and token_len - num_computed_tokens < self.cache_transfer_granularity
++                ):
++                    return 0, False
+                 if self.client is None:
+                     self.client = LookupKeyClient(self.vllm_config)
+                 num_external_hit_tokens = self.client.lookup(
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -126,6 +126,14 @@
+ SAVE_BATCH_FAILURE_POLL_INTERVAL_S = 1.0
+ 
+ 
++# --- KV pool lookup batching (added 2026-11-12) -----------------------------
++# All KV cache groups are looked up with one m_store.exists() round-trip instead
++# of one per group (production has 13 groups -> 13 sequential RPCs per request).
++_KVPOOL_BATCH_LOOKUP = os.environ.get(
++    "VLLM_ASCEND_V41_KVPOOL_BATCH_LOOKUP", "1"
++).strip().lower() in ("1", "true", "yes")
++
++
+ class KVPoolWorker:
+     # The main class for the cache engine.
+ 
+@@ -3566,15 +3574,33 @@
+             )
+             if coordinator_hit is not None:
+                 return coordinator_hit
+-            for group_id in kv_cache_group_ids:
+-                keys, starts, ends = self._build_lookup_keys(token_len, block_hashes, group_id, use_layerwise)
+-
+-                if not keys:
+-                    return 0
+-
+-                multi_tp_keys = self._expand_lookup_keys_by_rank(keys, group_id)
++            merged = _KVPOOL_BATCH_LOOKUP and not use_layerwise and len(kv_cache_group_ids) > 1
++            plans: list = []
++            merged_res = None
++            merged_off = 0
++            if merged:
++                all_keys = []
++                for group_id in kv_cache_group_ids:
++                    keys, starts, ends = self._build_lookup_keys(token_len, block_hashes, group_id, use_layerwise)
++                    if not keys:
++                        return 0
++                    multi_tp_keys = self._expand_lookup_keys_by_rank(keys, group_id)
++                    plans.append((keys, starts, ends, multi_tp_keys))
++                    all_keys.extend(multi_tp_keys)
++                merged_res = self.m_store.exists(all_keys)  # type: ignore[assignment]
++            for plan_idx, group_id in enumerate(kv_cache_group_ids):
++                if merged:
++                    keys, starts, ends, multi_tp_keys = plans[plan_idx]
++                    n_keys = len(multi_tp_keys)
++                    res = merged_res[merged_off : merged_off + n_keys]  # type: ignore[index]
++                    merged_off += n_keys
++                else:
++                    keys, starts, ends = self._build_lookup_keys(token_len, block_hashes, group_id, use_layerwise)
++                    if not keys:
++                        return 0
++                    multi_tp_keys = self._expand_lookup_keys_by_rank(keys, group_id)
++                    res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
+                 num_ranks = len(multi_tp_keys) // len(keys)
+-                res = self.m_store.exists(multi_tp_keys)  # type: ignore[assignment]
+                 num_block = len(keys)
+                 if use_layerwise:
+                     res = self.check_all_layers_exists(

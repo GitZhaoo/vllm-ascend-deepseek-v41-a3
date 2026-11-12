@@ -335,3 +335,27 @@ repo1 实测：conc=16 时 MoE 权重 34 GB/步、有效带宽 704→1170 GB/s �
 （c16 1338 为本轮实测最高；c64 1923≈生产基线）。TTFT 主要改善来自融合补丁与
 engram overlap，但幅度不稳定（249–282 ms），不要承诺 −44 ms。
 上线前仍需：0301 精度门 + engram ExternalEvent 一致性 + 长文针回归。
+
+
+---
+
+## 15. KV 池 lookup fast-path（0304）实测：机制正确，TTFT 收益不可分辨
+
+实现（`scripts/patches/experimental/0304-kvpool-lookup-fastpath.patch`）：
+
+1. `pool_scheduler.get_num_new_matched_tokens`：本地 prefix cache 覆盖到「剩余 token 少于
+   transfer granularity」时直接返回 0，跳过同步 ZMQ lookup（外部命中此时也会被 floor 成 0，
+   严格等价）；
+2. `pool_worker.lookup_scheduler`：13 个 KV cache group 的 `m_store.exists` 先合并成**一次**
+   批量查询，再按组切分返回。
+
+实测（KV 池 16×32GB 开启、生产参数不变、fusion+engram 默认开，隔离节点）：
+
+| 臂 | 热 TTFT | 冷 TTFT | 单流 tok/s | ms/step | c16 | c64 |
+|---|---:|---:|---:|---:|---:|---:|
+| gates OFF | 281 | 337 | 104.3 | 40.9 | 1,240 | 2,055 |
+| gates ON #1 | 255 | 311 | 104.9 | 40.5 | 1,228 | 1,983 |
+| gates ON #2 | 306 | 282 | 105.6 | 41.2 | 1,352 | 1,913 |
+
+**结论**：TTFT 在 255–306 之间摆动（OFF = 281），**不可分辨**；吞吐 +1%（噪声内）。
+补丁语义等价且只减少 RPC 次数，建议保持**默认关闭**，待 ≥5 样本或更细粒度计时骨架再定论。

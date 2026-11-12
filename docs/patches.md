@@ -82,6 +82,31 @@ scripts/patches/vllm-ced6857af/
 
 这是 6N 图桶之外最重要的 decode 侧收益之一。
 
+### 0304 — KV 池 lookup fast-path（`pool_scheduler.py` / `pool_worker.py`，默认开启）
+
+外部 KV 池开启时，每个请求都会在调度线程里做**同步 ZMQ lookup**。两处浪费：
+
+1. `get_num_new_matched_tokens` 只在 `num_computed_tokens >= token_len` 时跳过 RPC；
+   但 prefix cache 必然留下最后 ≥1 个 token 要算 ⇒ 条件几乎永不成立。补丁放宽为
+   「剩余 token < transfer granularity」即跳过（此时外部命中也会被 floor 成 0，跳过严格等价）；
+2. worker 侧 `lookup_scheduler` 对 **13 个 KV cache group 顺序各发一次 `m_store.exists`**
+   ⇒ 补丁先把所有 group 的 key 合并，一次 `exists` 批量查询后再按组切分。
+
+env（默认 1，设 0 回退）：`VLLM_ASCEND_V41_KVPOOL_SKIP_LOCAL_LOOKUP`、
+`VLLM_ASCEND_V41_KVPOOL_BATCH_LOOKUP`。
+
+实测（2026-11-12，KV 池 16×32GB 开启、生产参数不变，隔离节点配对 A/B）：
+
+| 指标 | 关 | 开 | Δ |
+|---|---:|---:|---:|
+| 单流 decode tok/s | 104.3 | 104.9 | +0.6% |
+| ms/step | 40.9 | **40.5** | −1.0% |
+| **TTFT（热前缀）** | 281 ms | **255 ms** | **−9.3%** |
+| 冷前缀 TTFT | 337 ms | **311 ms** | −7.7% |
+| 双前缀 c16 / c64 | 1,240 / 2,055 | 1,228 / 1,983 | 噪声内 |
+
+---
+
 ### 0202 — 多流 vector 核预算（`attention/dsa_v41.py`，默认开启）
 
 `dsa_v41.py` 的两条重叠流分工是：主流 cube 密集（`wq_a`/`wq_b` matmul），
