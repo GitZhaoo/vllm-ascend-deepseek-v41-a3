@@ -288,3 +288,26 @@ repo1 实测：conc=16 时 MoE 权重 34 GB/步、有效带宽 704→1170 GB/s �
   ms/step 40.4–41.1 → 40.2–40.3），精度零风险（只改核预算），可一键回退；
 - **预期管理**：同接受率配对口径只有 **≈+1%**，属于"顺手拿的小收益"，不要按 +9% 预估；
 - 生效方式：`bash scripts/apply_patches.sh apply` → 重启服务（生产需要一次窗口）。
+
+
+---
+
+## 13. 更正（2026-11-12 下午）：MegaMoe 从未生效，之前"TTFT −20~25%"是误判
+
+用引擎日志逐条核对把结论钉死：
+
+- exp41/exp42 的 serve 日志各有 **20 次** `MegaMoe is not supported for this model config;
+  additional_config.enable_fused_mc2 will be set to 0`，且 **0 条** `CANN MegaMoe sym-buffer alloc`；
+- 权重/激活/图显存与基线逐项一致（38.74 / 8.18 GiB）；
+- 根因：`ascend_config._is_megamoe_supported_by_config()` 的形状白名单拒绝 V4.1-Flash
+  （`moe_intermediate_size=2304`，`2304 % 512 != 0`），静默回滚到 MC2；
+- 于是 exp41/42 实际只改了一个东西：`multistream_overlap_shared_expert` 被互斥逻辑强制关闭
+  （`ascend_config.py:842`，回滚不恢复它）⇒ **decode −5%**、TTFT 无变化
+  （cold TTFT：基线 276.8/281.4 vs exp41 278.6 / exp42 278.9 ms）。
+
+**结论**：MegaMoe 在本模型上不可用（除非改形状白名单并验证算子 tiling，属高风险）；
+`enable_fused_mc2=2` 不要用于生产（白丢 ~5% 单流 decode）。prefill-only 门槛补丁在 mega 不可达时
+是死代码，保留作将来算子支持后的开关。
+
+**同时修正另一处**：`serve.sh` 里 `export HCCL_BUFFSIZE` 同样是裸 export ⇒
+`DSV41_HCCL_BUFFSIZE=1024` 从未生效（引擎 `/proc/environ` 无该变量）；已改为显式赋值。

@@ -235,7 +235,10 @@ unset NPU_VISIBLE_DEVICES ASCEND_VISIBLE_DEVICES 2>/dev/null || true
 # die with "Timed out waiting for engine core processes to start".
 export VLLM_ENGINE_READY_TIMEOUT_S="$DSV41_ENGINE_READY_TIMEOUT_S"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export HCCL_BUFFSIZE
+# Same trap as VLLM_ENGINE_READY_TIMEOUT_S: a bare `export VAR` only exports an
+# already-set variable, so DSV41_HCCL_BUFFSIZE was never applied (verified via
+# /proc/<engine>/environ). Assign it explicitly.
+export HCCL_BUFFSIZE="$DSV41_HCCL_BUFFSIZE"
 export HCCL_OP_EXPANSION_MODE="$DSV41_HCCL_OP_EXPANSION_MODE"
 [ "$DSV41_USE_V2" = "1" ] && export VLLM_USE_V2_MODEL_RUNNER=1
 
@@ -269,7 +272,8 @@ export VLLM_ASCEND_V41_ENGRAM_WKV_TP="${VLLM_ASCEND_V41_ENGRAM_WKV_TP:-1}"
 # 0202-limit-core-num.patch applied). 0 = disabled (upstream behaviour).
 # Measured on 2026-11-12: MAIN=16/AUX=32 gave +3~6% single-stream decode.
 # Defaults ON (2026-11-12): measured single-stream decode 100.4-104.2 -> 105.1-106.8 tok/s
-# (ms/step 40.4-41.1 -> 40.2-40.3) with production batch/seqs/bucket settings unchanged.
+# (ms/step 40.4-41.1 -> 40.2-40.3; paired same-acceptance口径 ≈+1%) with production
+# batch/seqs/bucket settings unchanged.
 # Set to 0 to restore upstream behaviour.
 export VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV:-16}"
 export VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV:-32}"
