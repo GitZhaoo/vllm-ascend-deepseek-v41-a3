@@ -3,6 +3,7 @@ logs/
 state/
 *.log
 models/
+rootfs/
 *.layers/
 *.tar
 *.tar.gz

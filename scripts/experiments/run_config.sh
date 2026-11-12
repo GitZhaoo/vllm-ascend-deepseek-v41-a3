@@ -66,7 +66,6 @@ pkill -9 -f "vllm[.]entrypoints[.]cli[.]main serve" 2>/dev/null || true
 pkill -9 -f "VLLM[:][:]" 2>/dev/null || true
 pkill -9 -f "prefix_router[.]py" 2>/dev/null || true
 pkill -9 -f "memcache[_]hybrid" 2>/dev/null || true
-pkill -9 -f "multiprocessing.spawn" 2>/dev/null || true
 # wait until the NPUs are actually released (crashed runs leave HCCL ports/NPU
 # memory busy for a while -> next start dies with HCCL EI0019 bind errors)
 for _ in $(seq 1 30); do
@@ -92,6 +91,16 @@ if [ "${EXP_PGO_SWAP:-0}" = "1" ] && [ -f "$PGO_LIB_DIR/libpython3.12.so.1.0" ];
   trap restore_pgo EXIT
 fi
 
+# --- safety checks ------------------------------------------------------------
+# Never touch ssh/frp processes: all kill patterns below are vLLM-specific.
+# Refuse to start when host memory is already tight (KV pool registers host DRAM).
+avail_gib=$(awk '/MemAvailable/{print int($2/1024/1024)}' /proc/meminfo)
+echo "--- host MemAvailable=${avail_gib} GiB"
+if [ "${avail_gib:-0}" -lt "${EXP_MIN_MEM_GIB:-200}" ]; then
+  echo "!!! only ${avail_gib} GiB available, need >= ${EXP_MIN_MEM_GIB:-200} GiB; aborting"
+  exit 1
+fi
+
 # --- start -------------------------------------------------------------------
 START_TS=$(date +%s)
 bash "$REPO/scripts/serve.sh" > "$EXP/logs/$CFG.launcher.log" 2>&1
@@ -104,7 +113,7 @@ for _ in $(seq 1 36); do
   sleep 5
 done
 MISS=0
-for _ in $(seq 1 90); do
+for _ in $(seq 1 ${EXP_READY_ITERS:-90}); do
   code=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' -m 3 \
     -H "Authorization: Bearer $DSV41_API_KEY" "http://127.0.0.1:$DSV41_PORT/health" 2>/dev/null)
   if [ "$code" = "200" ]; then READY=1; break; fi
