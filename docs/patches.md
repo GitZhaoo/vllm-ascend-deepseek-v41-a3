@@ -82,6 +82,25 @@ scripts/patches/vllm-ced6857af/
 
 这是 6N 图桶之外最重要的 decode 侧收益之一。
 
+### 0202 — 多流 vector 核预算（`attention/dsa_v41.py`，默认开启）
+
+`dsa_v41.py` 的两条重叠流分工是：主流 cube 密集（`wq_a`/`wq_b` matmul），
+重叠流 vector 密集（quantize / kv_norm / RoPE / SWA 写）。补丁用 CANN 低时延 recipe 的
+`torch.npu.npugraph_ex.scope.limit_core_num` 把 48 个 vector 核在两流之间分区：
+
+| env | 默认 | 作用 |
+|---|---|---|
+| `VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV` | **16** | 主流保留 16 vector 核 |
+| `VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV` | **32** | 重叠流 32 vector 核 |
+| `VLLM_ASCEND_V41_LIMIT_CORE_AIC` | **24** | cube 预算（不缩，保持满核） |
+
+实测（2026-11-12，生产参数 BAT 16384 / max_seqs 32 / 桶≤192 不变）：
+单流 decode **100.4–104.2 → 105.1–106.8 tok/s**、ms/step 40.4–41.1 → **40.2–40.3**、
+并发不变；同接受率配对口径约 +1%（噪声边缘，方向始终为正）。
+精度零风险（只改核预算，不改数值路径）。设为 0 可回退上游行为。
+
+---
+
 ### 0101 — KV 池 MRV2 抢占恢复（`pool_scheduler.py`）
 
 外部 KV 池接入 `AscendStoreConnector` 后，MRV2 通过 `scheduled_new_reqs`

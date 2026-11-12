@@ -268,9 +268,12 @@ export VLLM_ASCEND_V41_ENGRAM_WKV_TP="${VLLM_ASCEND_V41_ENGRAM_WKV_TP:-1}"
 # Optional per-stream core budget (A3 only; needs scripts/patches/experimental/
 # 0202-limit-core-num.patch applied). 0 = disabled (upstream behaviour).
 # Measured on 2026-11-12: MAIN=16/AUX=32 gave +3~6% single-stream decode.
-export VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV:-0}"
-export VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV:-0}"
-export VLLM_ASCEND_V41_LIMIT_CORE_AIC="${VLLM_ASCEND_V41_LIMIT_CORE_AIC:-0}"
+# Defaults ON (2026-11-12): measured single-stream decode 100.4-104.2 -> 105.1-106.8 tok/s
+# (ms/step 40.4-41.1 -> 40.2-40.3) with production batch/seqs/bucket settings unchanged.
+# Set to 0 to restore upstream behaviour.
+export VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_MAIN_AIV:-16}"
+export VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV="${VLLM_ASCEND_V41_LIMIT_CORE_AUX_AIV:-32}"
+export VLLM_ASCEND_V41_LIMIT_CORE_AIC="${VLLM_ASCEND_V41_LIMIT_CORE_AIC:-24}"
 
 # ---- rootfs Python + CANN --------------------------------------------------
 export PYTHONHOME="$PYTHON_HOME_DIR"
