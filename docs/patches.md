@@ -92,8 +92,9 @@ scripts/patches/vllm-ced6857af/
 2. worker 侧 `lookup_scheduler` 对 **13 个 KV cache group 顺序各发一次 `m_store.exists`**
    ⇒ 补丁先把所有 group 的 key 合并，一次 `exists` 批量查询后再按组切分。
 
-env（默认 1，设 0 回退）：`VLLM_ASCEND_V41_KVPOOL_SKIP_LOCAL_LOOKUP`、
-`VLLM_ASCEND_V41_KVPOOL_BATCH_LOOKUP`。
+env（**默认 1 = 开启**，设 0 回退）：`VLLM_ASCEND_V41_KVPOOL_SKIP_LOCAL_LOOKUP`、
+`VLLM_ASCEND_V41_KVPOOL_BATCH_LOOKUP`。补丁语义等价（跳过条件严格等价、批量查询只减少 RPC 次数），
+故默认开启；TTFT 收益在多次运行间于 255–306 ms 摆动（基线 281 ms），**不作收益承诺**。
 
 实测（2026-11-12，KV 池 16×32GB 开启、生产参数不变，隔离节点配对 A/B）：
 
