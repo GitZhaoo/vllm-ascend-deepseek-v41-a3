@@ -42,7 +42,11 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 : "${DSV41_SAFETENSORS_LOAD_STRATEGY:=lazy}"
 : "${DSV41_LOADER_THREADS:=128}"
 : "${DSV41_ENGINE_READY_TIMEOUT_S:=36000}"
-: "${DSV41_HCCL_BUFFSIZE:=1024}"
+# HCCL 通信缓冲（MB）。每 rank 两份常驻 HBM：1024 比 HCCL 默认 200 多吃约
+# 1.6 GiB/die，曾把 Available KV cache 压到 5.12 GiB（< 1M 上下文需要的
+# 5.56 GiB）导致起服失败。512 可回收约 1 GiB，KV 回到 ~6.1 GiB；decode 报文
+# 落在 HCCL 固定延迟区，实测 ms/step 基本不变。
+: "${DSV41_HCCL_BUFFSIZE:=512}"
 : "${DSV41_HCCL_OP_EXPANSION_MODE:=AIV}"
 : "${DSV41_TOKENIZER_MODE:=deepseek_v41}"
 : "${DSV41_REASONING_PARSER:=deepseek_v41}"

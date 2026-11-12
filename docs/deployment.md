@@ -194,7 +194,7 @@ API key、磁盘与代理环境。失败项会给出对应修复入口；建议�
 | `--additional-config` | CPU binding / 共享专家多流 / 关 npugraph_ex | 见下 |
 | `VLLM_USE_V2_MODEL_RUNNER` | 1 | Model Runner V2 |
 | `HCCL_OP_EXPANSION_MODE` | AIV | 集合通信展开从 HOST 下沉到 Vector Core |
-| `HCCL_BUFFSIZE` | 1024 | HCCL 缓冲 |
+| `HCCL_BUFFSIZE` | 512 | HCCL 通信缓冲；每 rank 两份常驻 HBM，1024 会多吃 ~1.6 GiB 并挤掉 1M 上下文的 KV 预算 |
 | `LD_PRELOAD` | libjemalloc.so.2 | 降低长 decode 的分配器争用 |
 
 完整默认值与覆盖方式见 `scripts/serve.sh` 顶部与 `config/dsv41.env.example`。
