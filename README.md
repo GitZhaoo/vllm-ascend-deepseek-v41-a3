@@ -131,6 +131,57 @@ tokens/step ≈ 3.57）。完整表见 [`docs/performance.md`](docs/performance.
 **2,439,086 tokens / DP rank（2.33×）**。32768 在 1M 上下文下放不进 55 GiB 预算。测量方法与
 取舍见 [`docs/performance.md`](docs/performance.md)。
 
+## 优化验证（2026-11-12，隔离节点实测）
+
+> 下表来自与生产**同硬件同镜像**的隔离测试节点（new_rl，8×910C / 16 die），
+> 权重 W8A8、拓扑 DP2×TP8/EP16、external LB、`BAT 16384 / max_num_seqs 32 / 图桶≤192`
+> 全部与生产一致；每组配置独立重启引擎，压测口径见 [`docs/optimization-deep-dive-2026-11-12.md`](docs/optimization-deep-dive-2026-11-12.md)。
+> 生产实例（new_rl3）未参与本轮压测。
+
+### 本轮实测有效的优化
+
+| 优化 | 开关 | 实测效果（同一节点配对 A/B） |
+|---|---|---|
+| `0202` 多流 vector 核预算（limit_core_num） | **默认开启**（`DSV41_LIMIT_CORE_MAIN_AIV=16 / AUX_AIV=32 / AIC=24`，设 0 回退） | 单流 decode 100.4–104.2 → **105.1–106.8 tok/s**；ms/step 40.4–41.1 → **40.2–40.3**；并发不变；精度零风险 |
+| `0302` 槽位链死代码跳过 + `0303` o_proj 免清零 | `scripts/patches/experimental/0302,0303`（env 默认关） | 配对 ms/step **41.2 → 40.9（−0.73%）**；零精度风险 |
+| `0301` q_norm+wq_b 融合（官方融合算子，35 层） | `VLLM_ASCEND_V41_QNORM_FUSE=1`（默认关） | 含在上面的 −0.73% 内；**上线前需过精度门**（融合算子非逐位） |
+| engram 辅助流 overlap | `multistream_engram_overlap=true`（默认关） | 相对上一行再 **−0.4~0.6 ms/步**；两次重复 ms/step 40.3 / 40.6；TTFT 改善不稳定（249/276 vs 基线 283–298） |
+
+### 优化后整机实测（2026-11-12）
+
+配置：上述四项全开（limit_core 默认 + 三个融合补丁 + engram overlap），生产参数锁死。
+
+| 并发（双前缀 A/B） | 聚合 tok/s | 单流 tok/s | TTFT |
+|---:|---:|---:|---:|
+| 2 | 153.2 | 109.2 | 1,147 ms |
+| 4 | 280.5 | 97.5 | 1,430 ms |
+| 8 | 748.9 | 109.3 | 372 ms |
+| 16 | **1,338.0** | 96.8 | 326 ms |
+| 32 | 1,721.3 | 71.2 | 1,209 ms |
+| 64 | **1,923.3** | 48.9 | 444 ms |
+
+单流（热前缀 794-token / 256 输出，temp=0）：**105.2 tok/s @ TTFT 282 ms**
+（优化前同节点基线：100.6–103.6 tok/s @ TTFT 283–298 ms；冷前缀 decode 114.8 tok/s）。
+
+### 已证伪 / 不可用（避免重复投入）
+
+- **MegaMoe（`enable_fused_mc2=2`）从未生效**：形状白名单拒绝 V4.1-Flash
+  （`moe_intermediate_size=2304` 不满足 `%512==0`），引擎日志明确回滚；
+  该开关只会顺带关掉 `multistream_overlap_shared_expert` ⇒ decode −5%。
+  验证补丁 `0310/0311` 留在 `scripts/patches/experimental/` 备查；
+- PGO libpython、KV 池开/关、BAT 8192：实测均在噪声内或无收益；
+- `npugraph_ex` / `static_kernel` / `fused_mc2=1` / `prefill_mc2` / `FULL_AND_PIECEWISE`：
+  本镜像启动失败、输出退化或并发回退；
+- 扩 `max_num_seqs`（64/128）+ 图桶：图捕获阶段卡死（DP 同步 hang），本镜像不可用；
+- TP16/DP1（Engram 限定 TP≤8）、W4A8 拓扑、单节点 PD 分离（W8A8 权重放不下）：不可行。
+
+### 下一步（唯一能显著提升单流的方向）
+
+当前 ms/step ≈40.4，到 120 tok/s 需要 ≈32 ms（−24%）。配置层与 Python 层已到顶，
+只剩 kernel 级工作：先做 **Triton 版 norm+quant 深度融合原型**
+（镜像自带 triton-ascend，本项目 `0005` 补丁已有先例；预期 1–3 天量化收益），
+再评估 AscendC 多合一 kernel（参考实现估算 12–24%，按周计 + 精度回归）。
+
 ## 软硬件基线
 
 | 项 | 版本 / 配置 |

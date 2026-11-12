@@ -163,8 +163,8 @@ export PATH=$ROOTFS/usr/local/python3.12.13/bin:$PATH
   --base-url "http://127.0.0.1:$DSV41_PORT" \
   --model DeepSeek-V4.1-Flash-1017 \
   --api-key "$DSV41_API_KEY" \
-  --max-tokens 256 --repeats 3 \
-  --dual-concurrency 2,16,64 \
+  --max-tokens 256 --repeats "${EXP_BENCH_REPEATS:-3}" \
+  --dual-concurrency "${EXP_DUAL_CONCURRENCY:-2,16,64}" \
   --out "$EXP/json/$CFG.json" 2>&1 | tee "$EXP/logs/$CFG.bench.log"
 
 # resource snapshot while idle-ish right after bench
